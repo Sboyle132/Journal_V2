@@ -14,6 +14,11 @@
 #   QUANTIZATION_MODE = 'ptq'         →  Post-Training Quantisation (TFLite)
 #   (float32 baseline always runs alongside for comparison)
 #
+# ── DSW WINDOW GRID SEARCH ───────────────────────────────────────────────────
+#   DSW_WINNER_RANGE / DSW_WOUTER_RANGE / DSW_PF_RANGE accept lists of values.
+#   Every valid combination is tried per scene; the best beta AUC is reported.
+#   Set each list to a single value to reproduce fixed-window behaviour.
+#
 # All user-configurable parameters are in the CONFIG PANEL below.
 # Do not edit anything below the CONFIG PANEL unless you know what you're doing.
 
@@ -27,7 +32,7 @@
 # ── Run mode ──────────────────────────────────────────────────────────────────
 #   'single' : run one scene, specified by SCENE_INDEX below
 #   'batch'  : run all scenes found in ABU_DATASET_DIR
-RUN_MODE    = 'single'
+RUN_MODE    = 'batch'
 
 # ── Scene selection (only used when RUN_MODE = 'single') ──────────────────────
 #   0  abu-airport-1       4  abu-beach-1       8  abu-urban-1
@@ -35,7 +40,7 @@ RUN_MODE    = 'single'
 #   2  abu-airport-3       6  abu-beach-3      10  abu-urban-3
 #   3  abu-airport-4       7  abu-beach-4      11  abu-urban-4
 #                                              12  abu-urban-5
-SCENE_INDEX = 1
+SCENE_INDEX = 0
 
 # ── Dataset path ──────────────────────────────────────────────────────────────
 ABU_DATASET_DIR = 'ABU_DATASET'
@@ -50,7 +55,7 @@ ABU_DATASET_DIR = 'ABU_DATASET'
 #                   rule of thumb: QUANT_BITS // 4  (e.g. 2 for 8-bit)
 #   QUANT_ACT_BITS: bit-width for the encoder sigmoid activation
 #   QUANT_ACT_INT : integer bits for activation (1 is correct for sigmoid)
-QUANTIZATION_MODE = 'qkeras_qat'   # 'qkeras_qat' | 'ptq'
+QUANTIZATION_MODE = 'ptq'   # 'qkeras_qat' | 'ptq'
 QUANT_BITS        = 8
 QUANT_INTEGER     = 2
 QUANT_ACT_BITS    = 8
@@ -87,17 +92,30 @@ AE_PATIENCE      = 15
 N_SAMPLES_TRAIN = 50000
 BATCH_SIZE      = 2048
 
-# ── DSW anomaly detector ──────────────────────────────────────────────────────
-#   DSW_WINNER : inner window size in pixels (odd integer, >= 1)
-#                anomalies are assumed to fit within this window
-#   DSW_WOUTER : outer window size in pixels (odd integer, > DSW_WINNER)
-#                k neighbours = DSW_WOUTER^2 - DSW_WINNER^2
-#   DSW_PF     : penalty factor for outlier neighbours  (0 <= pf < 1)
-#                0 = outlier neighbours contribute nothing (hard suppression)
-DSW_WINNER = 1
-DSW_WOUTER = 7
-DSW_PF     = 0
+# ── DSW anomaly detector — window grid search ─────────────────────────────────
+#   DSW_WINNER_RANGE : list of inner window sizes to try  (odd integers >= 1)
+#   DSW_WOUTER_RANGE : list of outer window sizes to try  (odd integers > winner)
+#   DSW_PF_RANGE     : list of penalty factors to try     (0 <= pf < 1)
+#
+#   For each scene every valid (winner, wouter, pf) combination is evaluated.
+#   The combination with the highest beta AUC on the float32 model is recorded
+#   as "best" and reported in the summary table alongside the fixed-window result.
+#   The same best (winner, wouter, pf) is also applied to the quantised model
+#   so the comparison remains fair.
+#
+#   To replicate the original paper's single fixed window, set each list to one
+#   value:  DSW_WINNER_RANGE = [1]  DSW_WOUTER_RANGE = [7]  DSW_PF_RANGE = [0]
+#
+#   Note: DSW is the CPU bottleneck — each (winner, wouter) pair on a 100×100
+#   image takes ~5–30 s.  A 3×5×1 grid = 15 combos × 2 models = 30 DSW passes.
+#DSW_WINNER_RANGE = [1, 3, 5]
+#DSW_WOUTER_RANGE = [7, 9, 11, 15, 21]
+#DSW_PF_RANGE     = [0]
 
+
+DSW_WINNER_RANGE = [1, 3, 5, 7, 9]
+DSW_WOUTER_RANGE = [3, 5, 7, 9, 11, 13, 15, 17, 19, 21]
+DSW_PF_RANGE     = [0]
 # ── Thresholding & evaluation ─────────────────────────────────────────────────
 #   THRESHOLD_PERCENTILE : anomaly pixels are those above this percentile
 #                          of the score map  (e.g. 95 = top 5%)
@@ -268,7 +286,6 @@ class GaussianRBM_NP:
         vel_v = np.zeros_like(self.v_bias)
         history = []
         N = len(data)
-        print(f"  RBM  {self.n_visible} -> {self.n_hidden}  ({n_epochs} epochs)")
         for epoch in range(n_epochs):
             idx   = np.random.permutation(N)
             total = 0.0
@@ -295,9 +312,8 @@ class GaussianRBM_NP:
                 count += 1
             avg = total / count
             history.append(float(avg))
-            if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1:>3}/{n_epochs}  recon-err: {avg:.6f}")
-        print(f"  RBM done.  Final loss: {history[-1]:.6f}")
+        print(f"  RBM {self.n_visible}→{self.n_hidden}  "
+              f"epochs={n_epochs}  final loss: {history[-1]:.6f}")
         return history
 
 
@@ -402,13 +418,12 @@ def train_autoencoder(model, X_train, save_dir, model_name):
         optimizer = optimizers.Adam(learning_rate=AE_LEARNING_RATE),
         loss      = losses.MeanSquaredError(),
     )
-    model.summary(line_length=72, print_fn=lambda x: print('  ' + x))
 
     ckpt_path = os.path.join(save_dir, f'{model_name}.h5')
     cb_list = [
         callbacks.EarlyStopping(
             monitor='loss', patience=AE_PATIENCE,
-            restore_best_weights=True, verbose=1,
+            restore_best_weights=True, verbose=0,
         ),
         callbacks.ReduceLROnPlateau(
             monitor='loss', factor=0.5, patience=5,
@@ -419,19 +434,19 @@ def train_autoencoder(model, X_train, save_dir, model_name):
         ),
     ]
 
-    print(f"  Fine-tuning [{model.name}]  "
-          f"epochs={AE_EPOCHS}  batch={BATCH_SIZE}  lr={AE_LEARNING_RATE}")
     history = model.fit(
         X_train, X_train,
         epochs           = AE_EPOCHS,
         batch_size       = BATCH_SIZE,
         validation_split = 0.0,
         callbacks        = cb_list,
-        verbose          = 1,
+        verbose          = 0,
         shuffle          = True,
     )
-    best = min(history.history['loss'])
-    print(f"  Done.  Best training loss: {best:.6f}")
+    best_loss   = min(history.history['loss'])
+    n_epochs_run = len(history.history['loss'])
+    print(f"  AE  [{model.name}]  "
+          f"epochs={n_epochs_run}/{AE_EPOCHS}  best loss: {best_loss:.6f}")
     return history.history
 
 
@@ -659,6 +674,9 @@ def _mawdbn_dsw(R, C_codes, winner, wouter, pf):
                 = r_p*pf/r_n_j  if outlier
          inlier : (r_n_j - mu_n) < sigma_n
       4. beta   = (1/k) * sum(wt_j * d_j)      (Eq 3: anomaly score)
+
+    Border pixels use whatever ring neighbours fall inside the image; the
+    existing valid-mask logic handles the reduced neighbour count naturally.
     """
     assert winner % 2 == 1 and wouter % 2 == 1, "winner and wouter must be odd"
     assert wouter > winner, "wouter must be > winner"
@@ -666,60 +684,152 @@ def _mawdbn_dsw(R, C_codes, winner, wouter, pf):
     H, W     = R.shape
     half_in  = winner  // 2
     half_out = wouter  // 2
-    padding  = half_out
-
-    ring = np.ones((wouter, wouter), dtype=bool)
-    ring[half_out-half_in : half_out+half_in+1,
-         half_out-half_in : half_out+half_in+1] = False
-
-    pad_R = np.pad(R, ((padding, padding), (padding, padding)),
-                   mode='constant', constant_values=-1)
-    pad_C = np.pad(C_codes, ((padding, padding), (padding, padding), (0, 0)),
-                   mode='constant', constant_values=0)
 
     beta_map = np.zeros((H, W), dtype=np.float32)
 
-    for j in tqdm(range(padding, H + padding), desc="  DSW rows", leave=False):
-        for i in range(padding, W + padding):
-            win_R = pad_R[j-half_out : j+half_out+1, i-half_out : i+half_out+1]
-            win_C = pad_C[j-half_out : j+half_out+1, i-half_out : i+half_out+1]
+    for j in tqdm(range(H), desc="  DSW rows", leave=False):
+        # Row bounds for the outer window, clamped to image
+        r0 = max(j - half_out, 0)
+        r1 = min(j + half_out + 1, H)
 
-            r_p = win_R[half_out, half_out]
-            if r_p == -1:
+        for i in range(W):
+            # Column bounds for the outer window, clamped to image
+            c0 = max(i - half_out, 0)
+            c1 = min(i + half_out + 1, W)
+
+            win_R = R[r0:r1, c0:c1]
+            win_C = C_codes[r0:r1, c0:c1]
+
+            r_p = R[j, i]
+
+            # Build ring mask over the actual (possibly clipped) window:
+            # a position belongs to the ring if it is outside the inner square
+            # relative to the centre of this window.
+            win_h, win_w = win_R.shape
+            cj = j - r0          # centre row within window
+            ci = i - c0          # centre col within window
+
+            row_idx = np.arange(win_h)[:, None]
+            col_idx = np.arange(win_w)[None, :]
+            in_inner = (
+                (np.abs(row_idx - cj) <= half_in) &
+                (np.abs(col_idx - ci) <= half_in)
+            )
+            is_centre = (row_idx == cj) & (col_idx == ci)
+            ring = ~in_inner & ~is_centre
+
+            rn = win_R[ring]
+            if rn.size == 0:
                 continue
 
-            rn    = win_R[ring]
-            valid = rn != -1
-            if not np.any(valid):
-                continue
+            mu_n  = float(rn.mean())
+            sig_n = float(rn.std())
 
-            rn_v  = rn[valid]
-            mu_n  = float(np.mean(rn_v))
-            sig_n = float(np.std(rn_v))
-
-            inlier = valid & ((rn - mu_n) < sig_n)
+            inlier = np.abs(rn - mu_n) <= sig_n
             wt = np.where(inlier,
                           r_p / (rn + 1e-12),
                           r_p * pf / (rn + 1e-12))
-            wt[~valid] = 0.0
 
-            c_p    = win_C[half_out, half_out]
+            c_p    = C_codes[j, i]
             c_ring = win_C[ring]
             d      = np.sqrt(np.sum((c_ring - c_p) ** 2, axis=1))
 
-            k_valid = int(np.sum(valid))
-            beta_map[j-padding, i-padding] = float(np.sum(wt * d)) / k_valid
+            beta_map[j, i] = float(np.sum(wt * d)) / rn.size
 
     return beta_map
 
 
-def compute_mawdbn_scores(rmse_map, latent_codes):
-    H, W = rmse_map.shape
-    k    = DSW_WOUTER**2 - DSW_WINNER**2
-    print(f"  DSW  winner={DSW_WINNER}  wouter={DSW_WOUTER}  "
-          f"pf={DSW_PF}  k={k}  image={H}x{W}")
+def compute_mawdbn_scores(rmse_map, latent_codes, winner, wouter, pf):
+    """
+    Run the DSW detector for a single (winner, wouter, pf) combination.
+    Called by dsw_grid_search; use that function rather than calling this directly.
+    """
     return _mawdbn_dsw(rmse_map.astype(np.float32), latent_codes,
-                       DSW_WINNER, DSW_WOUTER, DSW_PF)
+                       winner, wouter, pf)
+
+
+def dsw_grid_search(rmse_none, codes_none, rmse_quant, codes_quant, gt_mask):
+    """
+    Evaluate every valid (winner, wouter, pf) combination from the config ranges
+    on both the float32 and quantised RMSE/code maps.
+
+    Selection rule: best combination = highest beta AUC on the float32 model.
+    The same (winner, wouter, pf) is then applied to the quantised model so
+    the two are always compared under identical spatial parameters.
+
+    Parameters
+    ----------
+    rmse_none, codes_none   : float32 model outputs
+    rmse_quant, codes_quant : quantised model outputs
+    gt_mask                 : ground-truth binary mask (H, W) or None
+
+    Returns
+    -------
+    grid_results : list of dicts, one per (winner, wouter, pf) combo:
+        { 'winner', 'wouter', 'pf',
+          'beta_none', 'beta_quant',          -- score maps
+          'auc_beta_none', 'auc_beta_quant',  -- AUC values (None if no gt_mask)
+          'is_best' }                         -- True for the winning combo
+    best         : the dict from grid_results with the highest auc_beta_none
+                   (or first combo if no gt_mask)
+    """
+    # Build all valid combos
+    combos = []
+    for winner in DSW_WINNER_RANGE:
+        for wouter in DSW_WOUTER_RANGE:
+            for pf in DSW_PF_RANGE:
+                if wouter > winner and winner % 2 == 1 and wouter % 2 == 1:
+                    combos.append((winner, wouter, pf))
+
+    if not combos:
+        raise ValueError(
+            "DSW grid search produced no valid (winner, wouter, pf) combinations. "
+            "Check that winner < wouter and both are odd integers."
+        )
+
+    print(f"  DSW grid: {len(combos)} combo(s)  "
+          f"winner={DSW_WINNER_RANGE}  wouter={DSW_WOUTER_RANGE}  pf={DSW_PF_RANGE}")
+
+    grid_results = []
+
+    for winner, wouter, pf in tqdm(combos, desc="  DSW combos", leave=False):
+        beta_none  = compute_mawdbn_scores(rmse_none,  codes_none,
+                                           winner, wouter, pf)
+        beta_quant = compute_mawdbn_scores(rmse_quant, codes_quant,
+                                           winner, wouter, pf)
+
+        auc_bn = auc_bq = None
+        if gt_mask is not None:
+            auc_bn = roc_auc_score(gt_mask.reshape(-1).astype(int),
+                                   beta_none.reshape(-1))
+            auc_bq = roc_auc_score(gt_mask.reshape(-1).astype(int),
+                                   beta_quant.reshape(-1))
+
+        grid_results.append({
+            'winner': winner, 'wouter': wouter, 'pf': pf,
+            'beta_none':  beta_none,
+            'beta_quant': beta_quant,
+            'auc_beta_none':  auc_bn,
+            'auc_beta_quant': auc_bq,
+            'is_best': False,
+        })
+
+    # Pick best by float32 beta AUC (or first combo if no ground truth)
+    if gt_mask is not None:
+        best = max(grid_results, key=lambda r: r['auc_beta_none'])
+    else:
+        best = grid_results[0]
+    best['is_best'] = True
+
+    if gt_mask is not None:
+        print(f"\n  ★ Best combo: winner={best['winner']}  wouter={best['wouter']}  "
+              f"pf={best['pf']}  →  β AUC float32={best['auc_beta_none']:.4f}  "
+              f"{QUANTIZATION_MODE}={best['auc_beta_quant']:.4f}")
+    else:
+        print(f"\n  Using first combo (no gt_mask): winner={best['winner']}  "
+              f"wouter={best['wouter']}  pf={best['pf']}")
+
+    return grid_results, best
 
 
 # %% [markdown]
@@ -783,8 +893,10 @@ def plot_training_histories(rbm_losses, hist_none, hist_quant,
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    plt.close(fig)
+        plt.close(fig)
+    else:
+        plt.show()
+        plt.close(fig)
 
 
 def plot_comparison(image, gt_mask,
@@ -858,9 +970,10 @@ def plot_comparison(image, gt_mask,
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  Comparison figure -> {save_path}")
-    plt.show()
-    plt.close(fig)
+        plt.close(fig)
+    else:
+        plt.show()
+        plt.close(fig)
 
 
 def plot_roc_comparison(roc_none, roc_quant, scene_name, save_path=None):
@@ -890,9 +1003,10 @@ def plot_roc_comparison(roc_none, roc_quant, scene_name, save_path=None):
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  ROC -> {save_path}")
-    plt.show()
-    plt.close(fig)
+        plt.close(fig)
+    else:
+        plt.show()
+        plt.close(fig)
 
 
 # %% [markdown]
@@ -912,7 +1026,6 @@ def save_model_to_disk(model, scaler, save_dir, model_name, config_dict):
                 model,
                 os.path.join(save_dir, f'{model_name}_qweights.pkl'),
             )
-            print(f"  Q-weights -> {model_name}_qweights.pkl")
         except Exception as e:
             print(f"  model_save_quantized_weights skipped: {e}")
 
@@ -920,7 +1033,6 @@ def save_model_to_disk(model, scaler, save_dir, model_name, config_dict):
         f.write(f"Date: {datetime.now()}\n\n")
         for k, v in config_dict.items():
             f.write(f"{k}: {v}\n")
-    print(f"  Model saved -> {h5_path}")
 
 
 def load_model_h5(model_path, scaler_path, mode):
@@ -929,7 +1041,6 @@ def load_model_h5(model_path, scaler_path, mode):
         custom_objects = qkeras.get_custom_objects()
     model  = keras.models.load_model(model_path, custom_objects=custom_objects)
     scaler = joblib.load(scaler_path)
-    print(f"  Loaded {model_path}")
     return model, scaler
 
 
@@ -967,18 +1078,15 @@ def run_scene(scene_name, mat_path):
         'ae_patience':       AE_PATIENCE,
         'batch_size':        BATCH_SIZE,
         'n_samples_train':   N_SAMPLES_TRAIN,
-        'dsw_winner':        DSW_WINNER,
-        'dsw_wouter':        DSW_WOUTER,
-        'dsw_pf':            DSW_PF,
+        'dsw_winner_range':  DSW_WINNER_RANGE,
+        'dsw_wouter_range':  DSW_WOUTER_RANGE,
+        'dsw_pf_range':      DSW_PF_RANGE,
         'threshold_pct':     THRESHOLD_PERCENTILE,
         'random_seed':       RANDOM_SEED,
     }
 
     # ── Step 1: Load ───────────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"  SCENE: {scene_name.upper()}")
-    print(f"{'='*70}")
-    print("\nSTEP 1 | LOAD DATA")
+    print(f"\n── {scene_name.upper()} ──────────────────────────────────────────────")
     image, gt_mask, C = load_abu_mat(mat_path)
     H, W, _ = image.shape
 
@@ -986,12 +1094,10 @@ def run_scene(scene_name, mat_path):
     rng      = np.random.default_rng(RANDOM_SEED)
     idx      = rng.choice(H * W, size=n_train, replace=False)
     train_px = image.reshape(-1, C)[idx]
-    print(f"  Training pixels: {n_train:,}  ({100*n_train/(H*W):.1f}% of image)")
     norm_px, scaler = preprocess_pixels(train_px, fit_scaler=True)
-    print(f"  Normalised — mean: {norm_px.mean():.4f}  std: {norm_px.std():.4f}")
+    print(f"  {H}×{W}×{C}  |  {n_train:,} training pixels")
 
     # ── Step 2: RBM (shared) ───────────────────────────────────────────────────
-    print("\nSTEP 2 | RBM PRE-TRAINING  (shared; both models start from same init)")
     rbm = GaussianRBM_NP(n_visible=C, n_hidden=N_HIDDEN, k=RBM_K)
     rbm_losses = rbm.train(
         norm_px,
@@ -1001,7 +1107,6 @@ def run_scene(scene_name, mat_path):
     )
 
     # ── Step 3a: Float32 baseline ──────────────────────────────────────────────
-    print("\nSTEP 3a | FLOAT32 BASELINE")
     ae_none = build_autoencoder(C, N_HIDDEN, mode='none')
     initialize_from_rbm(ae_none, rbm)
     mn_none   = f'mawdbn_none_{scene_name}'
@@ -1009,110 +1114,95 @@ def run_scene(scene_name, mat_path):
     save_model_to_disk(ae_none, scaler, save_dir, mn_none, config_dict)
 
     # ── Step 3b: Quantised model ───────────────────────────────────────────────
-    print(f"\nSTEP 3b | {QUANTIZATION_MODE.upper()} QUANTISED MODEL")
-    set_seed(RANDOM_SEED)   # re-seed so both models see identical random state
+    set_seed(RANDOM_SEED)
     ae_quant   = build_autoencoder(C, N_HIDDEN, mode=QUANTIZATION_MODE)
     initialize_from_rbm(ae_quant, rbm)
     mn_quant   = f'mawdbn_{QUANTIZATION_MODE}_{scene_name}'
     hist_quant = train_autoencoder(ae_quant, norm_px, save_dir, mn_quant)
     save_model_to_disk(ae_quant, scaler, save_dir, mn_quant, config_dict)
 
-    # ── PTQ: export BOTH full-AE and encoder-only to TFLite INT8 ──────────────
-    # This must happen before Step 4 so the .tflite files exist for inference.
-    # Design fix: PTQ inference uses the TFLite interpreter (not model.predict),
-    # so the RMSE and latent codes genuinely reflect INT8 quantised arithmetic.
+    # ── PTQ: export to TFLite INT8 ─────────────────────────────────────────────
     tflite_ae_path = None
     if QUANTIZATION_MODE == 'ptq':
-        print("\n  PTQ | Exporting full-AE and encoder to TFLite INT8 ...")
         tflite_ae_path = export_tflite_ptq(
             ae_quant, norm_px[:200], save_dir, mn_quant)
         export_tflite_encoder(
             ae_quant, norm_px[:200], save_dir, mn_quant,
             mode=QUANTIZATION_MODE)
 
-    # ── Training history ───────────────────────────────────────────────────────
+    # ── Training history (save only) ───────────────────────────────────────────
     plot_training_histories(
         rbm_losses, hist_none, hist_quant, scene_name,
         save_path=os.path.join(save_dir, f'{scene_name}_training.png'),
     )
 
     # ── Step 4: Reconstruction error + latent codes ────────────────────────────
-    print("\nSTEP 4 | RECONSTRUCTION ERROR + LATENT CODES")
     enc_none = build_encoder_only(ae_none, mode='none')
-
-    print("  float32 forward pass ...")
     rmse_none, codes_none = compute_recon_and_codes(
         ae_none, enc_none, image, scaler)
 
     if QUANTIZATION_MODE == 'ptq':
-        # Use the TFLite INT8 interpreter for genuine PTQ inference.
-        # model.predict() on ae_quant would give float32 results identical
-        # to the 'none' baseline — that is the design gap this fixes.
-        print("  PTQ INT8 forward pass (TFLite interpreter) ...")
         rmse_quant, codes_quant = compute_recon_and_codes_tflite(
             tflite_ae_path, N_HIDDEN, image, scaler)
     else:
         enc_quant = build_encoder_only(ae_quant, mode=QUANTIZATION_MODE)
-        print("  quantised forward pass ...")
         rmse_quant, codes_quant = compute_recon_and_codes(
             ae_quant, enc_quant, image, scaler)
 
-    for tag, rm in [('float32', rmse_none), (QUANTIZATION_MODE, rmse_quant)]:
-        print(f"  RMSE [{tag:<12}]  "
-              f"mean={rm.mean():.5f}  std={rm.std():.5f}  max={rm.max():.5f}")
+    # ── Step 5: DSW window grid search ────────────────────────────────────────
+    grid_results, best = dsw_grid_search(
+        rmse_none, codes_none, rmse_quant, codes_quant, gt_mask)
 
-    # ── Step 5: MAWDBN beta score ──────────────────────────────────────────────
-    print("\nSTEP 5 | MAWDBN beta SCORE")
-    print("  float32 ...")
-    beta_none  = compute_mawdbn_scores(rmse_none,  codes_none)
-    print("  quantised ...")
-    beta_quant = compute_mawdbn_scores(rmse_quant, codes_quant)
+    beta_none  = best['beta_none']
+    beta_quant = best['beta_quant']
+    fixed      = grid_results[0]
+    beta_none_fixed  = fixed['beta_none']
+    beta_quant_fixed = fixed['beta_quant']
 
     # ── Step 6: Threshold ──────────────────────────────────────────────────────
-    print("\nSTEP 6 | THRESHOLD")
     pct = THRESHOLD_PERCENTILE
     rmse_mask_none,  _ = threshold_score_map(rmse_none,  pct)
     beta_mask_none,  _ = threshold_score_map(beta_none,  pct)
     rmse_mask_quant, _ = threshold_score_map(rmse_quant, pct)
     beta_mask_quant, _ = threshold_score_map(beta_quant, pct)
-    print(f"  float32:  RMSE mask {rmse_mask_none.sum():,} px  |  "
-          f"beta mask {beta_mask_none.sum():,} px")
-    print(f"  {QUANTIZATION_MODE}: RMSE mask {rmse_mask_quant.sum():,} px  |  "
-          f"beta mask {beta_mask_quant.sum():,} px")
 
     # ── Step 7: AUC-ROC ────────────────────────────────────────────────────────
-    print("\nSTEP 7 | AUC-ROC EVALUATION")
     roc_none  = {}
     roc_quant = {}
     result    = {'scene': scene_name}
 
     if gt_mask is not None:
-        print("  ── float32 ──────────────────────────────────")
-        auc_rn, fpr_rn, tpr_rn = evaluate_auc(rmse_none,  gt_mask, 'RMSE   float32')
-        auc_bn, fpr_bn, tpr_bn = evaluate_auc(beta_none,  gt_mask, 'beta   float32')
-        roc_none = {
-            'RMSE':   (auc_rn, fpr_rn, tpr_rn),
-            'MAWDBN': (auc_bn, fpr_bn, tpr_bn),
-        }
-        print(f"  ── {QUANTIZATION_MODE} ────────────────────────────────")
-        auc_rq, fpr_rq, tpr_rq = evaluate_auc(rmse_quant, gt_mask,
-                                               f'RMSE   {QUANTIZATION_MODE}')
-        auc_bq, fpr_bq, tpr_bq = evaluate_auc(beta_quant, gt_mask,
-                                               f'beta   {QUANTIZATION_MODE}')
-        roc_quant = {
-            'RMSE':   (auc_rq, fpr_rq, tpr_rq),
-            'MAWDBN': (auc_bq, fpr_bq, tpr_bq),
-        }
+        auc_rn, fpr_rn, tpr_rn = evaluate_auc(rmse_none,  gt_mask, 'RMSE  f32')
+        auc_bn, fpr_bn, tpr_bn = evaluate_auc(beta_none,  gt_mask, 'β     f32')
+        auc_bn_fixed, _, _     = evaluate_auc(beta_none_fixed, gt_mask, 'β     f32 fixed')
+        auc_rq, fpr_rq, tpr_rq = evaluate_auc(rmse_quant, gt_mask, f'RMSE  {QUANTIZATION_MODE}')
+        auc_bq, fpr_bq, tpr_bq = evaluate_auc(beta_quant, gt_mask, f'β     {QUANTIZATION_MODE}')
+        auc_bq_fixed, _, _     = evaluate_auc(beta_quant_fixed, gt_mask, f'β     {QUANTIZATION_MODE} fixed')
 
-        print(f"\n  ── DELTA  ({QUANTIZATION_MODE} - float32) ────────────────")
-        print(f"  RMSE   delta = {auc_rq - auc_rn:+.4f}")
-        print(f"  beta   delta = {auc_bq - auc_bn:+.4f}")
+        roc_none  = {'RMSE': (auc_rn, fpr_rn, tpr_rn), 'MAWDBN': (auc_bn, fpr_bn, tpr_bn)}
+        roc_quant = {'RMSE': (auc_rq, fpr_rq, tpr_rq), 'MAWDBN': (auc_bq, fpr_bq, tpr_bq)}
+
+        print(f"  AUC  RMSE={auc_rn:.4f}→{auc_rq:.4f}({auc_rq-auc_rn:+.4f})  "
+              f"β={auc_bn:.4f}→{auc_bq:.4f}({auc_bq-auc_bn:+.4f})  "
+              f"best DSW w={best['winner']},W={best['wouter']}")
 
         result.update({
-            'auc_rmse_none':  auc_rn,
-            'auc_beta_none':  auc_bn,
-            'auc_rmse_quant': auc_rq,
-            'auc_beta_quant': auc_bq,
+            'auc_rmse_none':        auc_rn,
+            'auc_beta_none':        auc_bn,
+            'auc_rmse_quant':       auc_rq,
+            'auc_beta_quant':       auc_bq,
+            'auc_beta_none_fixed':  auc_bn_fixed,
+            'auc_beta_quant_fixed': auc_bq_fixed,
+            'best_winner': best['winner'],
+            'best_wouter': best['wouter'],
+            'best_pf':     best['pf'],
+            'dsw_grid': [
+                {'winner': r['winner'], 'wouter': r['wouter'], 'pf': r['pf'],
+                 'auc_beta_none': r['auc_beta_none'],
+                 'auc_beta_quant': r['auc_beta_quant'],
+                 'is_best': r['is_best']}
+                for r in grid_results
+            ],
         })
 
         plot_roc_comparison(
@@ -1122,8 +1212,7 @@ def run_scene(scene_name, mat_path):
     else:
         print("  No ground truth — skipping AUC.")
 
-    # ── Step 8: Comparison figure ──────────────────────────────────────────────
-    print("\nSTEP 8 | VISUALISATION")
+    # ── Step 8: Comparison figure (save only) ─────────────────────────────────
     plot_comparison(
         image, gt_mask,
         rmse_none,  beta_none,  rmse_mask_none,  beta_mask_none,
@@ -1133,9 +1222,8 @@ def run_scene(scene_name, mat_path):
     )
 
     # ── Step 9: Save arrays ────────────────────────────────────────────────────
-    print("\nSTEP 9 | SAVE ARRAYS")
     for tag, rm, bm, rm_m, bm_m, codes in [
-        ('none',        rmse_none,  beta_none,
+        ('none',            rmse_none,  beta_none,
          rmse_mask_none,  beta_mask_none,  codes_none),
         (QUANTIZATION_MODE, rmse_quant, beta_quant,
          rmse_mask_quant, beta_mask_quant, codes_quant),
@@ -1146,7 +1234,7 @@ def run_scene(scene_name, mat_path):
         np.save(f'{prefix}_rmse_mask.npy',    rm_m)
         np.save(f'{prefix}_beta_mask.npy',    bm_m)
         np.save(f'{prefix}_latent_codes.npy', codes)
-    print(f"  Arrays saved -> {save_dir}/")
+    print(f"  Saved -> {save_dir}/")
 
     return result
 
@@ -1157,17 +1245,20 @@ def run_scene(scene_name, mat_path):
 # %%
 def _print_final_summary(results):
     """
-    Print a structured AUC summary table covering:
-      - Every scene individually
-      - Per-type averages (airport / beach / urban)
-      - Overall average across all scenes
-      - Best metric per column
+    Print a structured AUC summary table with three sections:
 
-    Columns: RMSE-f32 | RMSE-qt | ΔRMSE | β-f32 | β-qt | Δβ
+    Section 1 — Main results (best DSW window per scene):
+      RMSE-f32 | RMSE-qt | ΔRMSE | β-f32(best) | β-qt(best) | Δβ
+      Per-type group averages + overall average.
 
-    Also saves the table as a plain-text file in RESULTS_DIR.
+    Section 2 — Window tuning impact (best vs fixed):
+      β-f32(fixed) | β-f32(best) | Δ(tuning) | best params (w, W)
+
+    Section 3 — Full DSW grid per scene:
+      One sub-row per (winner, wouter, pf) combo showing β AUC for both models.
+
+    Also saves the full table as a .txt file in RESULTS_DIR.
     """
-    # Filter to scenes that have valid AUC results
     valid = [r for r in results if 'auc_rmse_none' in r]
     if not valid:
         print("  No valid results to summarise.")
@@ -1179,96 +1270,90 @@ def _print_final_summary(results):
     def fmt(v):
         return f"{v:.4f}" if v is not None else "  N/A "
 
-    def row(label, rn, bn, rq, bq, indent="  "):
-        dr = rq - rn if (rq is not None and rn is not None) else None
-        db = bq - bn if (bq is not None and bn is not None) else None
+    def delta_str(a, b):
+        return f"{b - a:+.4f}" if (a is not None and b is not None) else "  N/A "
+
+    def row_main(label, rn, bn, rq, bq, bw=None, bW=None, indent="  "):
+        dsw = f"w{bw},W{bW}" if (bw is not None and bW is not None) else "  N/A"
         return (f"{indent}{label:<{W}}  "
-                f"{fmt(rn):>8}  {fmt(rq):>8}  "
-                f"{(f'{dr:+.4f}' if dr is not None else '  N/A '):>8}  "
-                f"{fmt(bn):>8}  {fmt(bq):>8}  "
-                f"{(f'{db:+.4f}' if db is not None else '  N/A '):>8}")
+                f"{fmt(rn):>8}  {fmt(rq):>8}  {delta_str(rn,rq):>8}  "
+                f"{fmt(bn):>8}  {fmt(bq):>8}  {delta_str(bn,bq):>8}  "
+                f"{dsw:>9}")
 
-    header = (f"  {'Scene':<{W}}  "
-              f"{'RMSE-f32':>8}  {'RMSE-'+qm[:3]:>8}  {'ΔRMSE':>8}  "
-              f"{'β-f32':>8}  {'β-'+qm[:3]:>8}  {'Δβ':>8}")
-    divider = "  " + "-" * (W + 2 + 8*6 + 2*5)
+    def group_avg(grp, key):
+        vals = [r[key] for r in grp if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
 
-    lines_out = []
-
-    def pr(s=""):
-        print(s)
-        lines_out.append(s)
-
-    # Determine scene types present
     TYPES = {
         'airport': [r for r in valid if 'airport' in r['scene']],
         'beach':   [r for r in valid if 'beach'   in r['scene']],
         'urban':   [r for r in valid if 'urban'   in r['scene']],
     }
 
-    def group_avg(grp, key):
-        vals = [r[key] for r in grp if r.get(key) is not None]
-        return sum(vals) / len(vals) if vals else None
+    border  = "=" * 102
+    divider = "  " + "-" * 98
+    lines_out = []
 
-    # ── Header ─────────────────────────────────────────────────────────────────
-    border = "=" * (W + 2 + 8*6 + 2*5 + 2)
+    def pr(s=""):
+        print(s)
+        lines_out.append(s)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1: Main results (best-window AUC)
+    # ══════════════════════════════════════════════════════════════════════════
     pr()
     pr(border)
     pr(f"  FINAL AUC SUMMARY  |  float32 vs {qm.upper()}  |  ABU DATASET")
+    pr(f"  β scores use best DSW window per scene (chosen on float32 AUC)")
     pr(border)
-    pr(header)
+    hdr = (f"  {'Scene':<{W}}  "
+           f"{'RMSE-f32':>8}  {'RMSE-qt':>8}  {'ΔRMSE':>8}  "
+           f"{'β-f32':>8}  {'β-qt':>8}  {'Δβ':>8}  {'best DSW':>9}")
+    pr(hdr)
     pr(divider)
 
-    # ── Per-type groups ────────────────────────────────────────────────────────
     for tname, grp in TYPES.items():
         if not grp:
             continue
-        # Individual scenes
         for r in grp:
-            pr(row(r['scene'],
-                   r['auc_rmse_none'], r['auc_beta_none'],
-                   r['auc_rmse_quant'], r['auc_beta_quant']))
-        # Group average
+            pr(row_main(r['scene'],
+                        r['auc_rmse_none'],  r['auc_beta_none'],
+                        r['auc_rmse_quant'], r['auc_beta_quant'],
+                        r.get('best_winner'), r.get('best_wouter')))
         avg_rn = group_avg(grp, 'auc_rmse_none')
         avg_bn = group_avg(grp, 'auc_beta_none')
         avg_rq = group_avg(grp, 'auc_rmse_quant')
         avg_bq = group_avg(grp, 'auc_beta_quant')
         pr(divider)
-        pr(row(f"  AVG {tname.upper()} ({len(grp)} scenes)",
-               avg_rn, avg_bn, avg_rq, avg_bq, indent=""))
+        pr(row_main(f"  AVG {tname.upper()} ({len(grp)} scenes)",
+                    avg_rn, avg_bn, avg_rq, avg_bq, indent=""))
         pr(divider)
 
-    # ── Overall average ────────────────────────────────────────────────────────
     all_rn = group_avg(valid, 'auc_rmse_none')
     all_bn = group_avg(valid, 'auc_beta_none')
     all_rq = group_avg(valid, 'auc_rmse_quant')
     all_bq = group_avg(valid, 'auc_beta_quant')
-    pr(row(f"  OVERALL AVG ({len(valid)} scenes)",
-           all_rn, all_bn, all_rq, all_bq, indent=""))
+    pr(row_main(f"  OVERALL AVG ({len(valid)} scenes)",
+                all_rn, all_bn, all_rq, all_bq, indent=""))
     pr(border)
 
-    # ── Best / worst per column ────────────────────────────────────────────────
+    # ── Best / worst ───────────────────────────────────────────────────────────
     pr()
     pr("  BEST SCENE PER METRIC:")
-    metrics = [
-        ('RMSE-f32',   'auc_rmse_none'),
-        ('RMSE-'+qm,   'auc_rmse_quant'),
-        ('β-f32',      'auc_beta_none'),
-        ('β-'+qm,      'auc_beta_quant'),
-    ]
-    for label, key in metrics:
-        best = max(valid, key=lambda r: r.get(key, 0))
-        pr(f"    {label:<16}  {best['scene']:<22}  AUC = {best[key]:.4f}")
-
+    for label, key in [('RMSE-f32','auc_rmse_none'), (f'RMSE-{qm}','auc_rmse_quant'),
+                        ('β-f32','auc_beta_none'),    (f'β-{qm}','auc_beta_quant')]:
+        bst = max(valid, key=lambda r: r.get(key, 0))
+        pr(f"    {label:<20}  {bst['scene']:<22}  AUC = {bst[key]:.4f}")
     pr()
     pr("  WORST SCENE PER METRIC:")
-    for label, key in metrics:
-        worst = min(valid, key=lambda r: r.get(key, 1))
-        pr(f"    {label:<16}  {worst['scene']:<22}  AUC = {worst[key]:.4f}")
+    for label, key in [('RMSE-f32','auc_rmse_none'), (f'RMSE-{qm}','auc_rmse_quant'),
+                        ('β-f32','auc_beta_none'),    (f'β-{qm}','auc_beta_quant')]:
+        wst = min(valid, key=lambda r: r.get(key, 1))
+        pr(f"    {label:<20}  {wst['scene']:<22}  AUC = {wst[key]:.4f}")
 
-    # ── Quantisation impact summary ────────────────────────────────────────────
+    # ── Quantisation impact ────────────────────────────────────────────────────
     pr()
-    pr(f"  QUANTISATION IMPACT  ({qm} vs float32):")
+    pr(f"  QUANTISATION IMPACT  ({qm} vs float32, best window):")
     if all_rn and all_rq:
         pr(f"    Avg RMSE delta : {all_rq - all_rn:+.4f}  "
            f"({'improved' if all_rq > all_rn else 'degraded'})")
@@ -1277,7 +1362,67 @@ def _print_final_summary(results):
            f"({'improved' if all_bq > all_bn else 'degraded'})")
     pr(border)
 
-    # ── Save to file ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2: Window tuning impact
+    # ══════════════════════════════════════════════════════════════════════════
+    has_fixed = all(r.get('auc_beta_none_fixed') is not None for r in valid)
+    if has_fixed:
+        pr()
+        pr(border)
+        pr("  WINDOW TUNING IMPACT  (best window vs fixed/first window)")
+        pr(border)
+        hdr2 = (f"  {'Scene':<{W}}  "
+                f"{'β-f32(fix)':>10}  {'β-f32(best)':>11}  {'Δ(tuning)':>10}  "
+                f"{'best w':>6}  {'best W':>6}  {'pf':>4}")
+        pr(hdr2)
+        pr(divider)
+        for tname, grp in TYPES.items():
+            if not grp:
+                continue
+            for r in grp:
+                d = delta_str(r['auc_beta_none_fixed'], r['auc_beta_none'])
+                pr(f"  {r['scene']:<{W}}  "
+                   f"{fmt(r['auc_beta_none_fixed']):>10}  "
+                   f"{fmt(r['auc_beta_none']):>11}  "
+                   f"{d:>10}  "
+                   f"{r.get('best_winner','?'):>6}  "
+                   f"{r.get('best_wouter','?'):>6}  "
+                   f"{r.get('best_pf', '?'):>4}")
+            pr(divider)
+        all_bn_fixed = group_avg(valid, 'auc_beta_none_fixed')
+        if all_bn_fixed and all_bn:
+            pr(f"  {'OVERALL AVG':<{W}}  "
+               f"{fmt(all_bn_fixed):>10}  {fmt(all_bn):>11}  "
+               f"{delta_str(all_bn_fixed, all_bn):>10}")
+        pr(border)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3: Full DSW grid per scene
+    # ══════════════════════════════════════════════════════════════════════════
+    has_grid = any(r.get('dsw_grid') for r in valid)
+    if has_grid:
+        pr()
+        pr(border)
+        pr("  FULL DSW GRID RESULTS  (β AUC per (winner, wouter, pf) combination)")
+        pr(border)
+        for r in valid:
+            if not r.get('dsw_grid'):
+                continue
+            pr(f"  {r['scene']}")
+            pr(f"    {'winner':>6}  {'wouter':>6}  {'pf':>4}  "
+               f"{'β-f32':>8}  {'β-qt':>8}  {'Δβ':>8}  {'':>4}")
+            for g in r['dsw_grid']:
+                star = " ★" if g['is_best'] else "  "
+                bn  = fmt(g['auc_beta_none'])
+                bq  = fmt(g['auc_beta_quant'])
+                db  = delta_str(g['auc_beta_none'], g['auc_beta_quant']) \
+                      if (g['auc_beta_none'] and g['auc_beta_quant']) else "  N/A "
+                pr(f"    {g['winner']:>6}  {g['wouter']:>6}  {g['pf']:>4}  "
+                   f"{bn:>8}  {bq:>8}  {db:>8}{star}")
+            pr()
+        pr(border)
+
+    # ── Save ───────────────────────────────────────────────────────────────────
     summary_dir  = os.path.join(RESULTS_DIR, 'dbn_abu_qkeras')
     os.makedirs(summary_dir, exist_ok=True)
     summary_path = os.path.join(summary_dir,
@@ -1289,68 +1434,111 @@ def _print_final_summary(results):
 
 def _plot_final_summary(results):
     """
-    Bar chart comparing float32 vs quantised beta AUC per scene,
-    with type-grouped colour coding and a dashed line for the overall average.
-    Saved alongside the text summary.
+    Two-panel figure:
+      Top: β AUC bar chart — float32 best-window vs quantised best-window
+           + dashed lines for overall averages
+      Bottom: β AUC tuning-gain chart — fixed-window vs best-window (float32 only)
+              so the contribution of window search is visually clear
+    Annotates each bar with the best (w, W) parameters.
     """
     valid = [r for r in results if 'auc_rmse_none' in r]
     if not valid:
         return
+
+    has_fixed = all(r.get('auc_beta_none_fixed') is not None for r in valid)
 
     scenes    = [r['scene'] for r in valid]
     beta_none = [r['auc_beta_none']  for r in valid]
     beta_qt   = [r['auc_beta_quant'] for r in valid]
     n         = len(scenes)
     x         = np.arange(n)
-    w         = 0.35
+    w         = 0.32
+    xlabels   = [s.replace('abu-', '') for s in scenes]
 
-    # Colour by scene type
     colours_none = ['#4e79a7' if 'airport' in s
                     else '#f28e2b' if 'beach' in s
                     else '#59a14f' for s in scenes]
     colours_qt   = ['#76b7f7' if 'airport' in s
                     else '#ffc97f' if 'beach' in s
                     else '#8be08e' for s in scenes]
+    colours_fix  = ['#c0c0c0'] * n   # grey for fixed baseline
 
-    fig, ax = plt.subplots(figsize=(max(12, n * 1.1), 6))
+    nrows = 2 if has_fixed else 1
+    fig, axes = plt.subplots(nrows, 1,
+                             figsize=(max(14, n * 1.2), 5 * nrows),
+                             squeeze=False)
 
-    ax.bar(x - w/2, beta_none, w, color=colours_none,
-           edgecolor='white', lw=0.5, label='β float32')
-    ax.bar(x + w/2, beta_qt,   w, color=colours_qt,
-           edgecolor='white', lw=0.5,
-           label=f'β {QUANTIZATION_MODE}', alpha=0.9)
+    # ── Panel 1: best-window comparison ───────────────────────────────────────
+    ax = axes[0, 0]
+    b1 = ax.bar(x - w/2, beta_none, w, color=colours_none,
+                edgecolor='white', lw=0.5, label='β float32 (best window)')
+    b2 = ax.bar(x + w/2, beta_qt,   w, color=colours_qt,
+                edgecolor='white', lw=0.5,
+                label=f'β {QUANTIZATION_MODE} (best window)', alpha=0.9)
 
-    overall_avg_none = float(np.mean(beta_none))
-    overall_avg_qt   = float(np.mean(beta_qt))
-    ax.axhline(overall_avg_none, color='#4e79a7', ls='--', lw=1.5,
-               label=f'overall avg f32 = {overall_avg_none:.4f}')
-    ax.axhline(overall_avg_qt,   color='#76b7f7', ls=':',  lw=1.5,
-               label=f'overall avg qt  = {overall_avg_qt:.4f}')
+    avg_none = float(np.mean(beta_none))
+    avg_qt   = float(np.mean(beta_qt))
+    ax.axhline(avg_none, color='#4e79a7', ls='--', lw=1.5,
+               label=f'avg f32 = {avg_none:.4f}')
+    ax.axhline(avg_qt,   color='#76b7f7', ls=':',  lw=1.5,
+               label=f'avg qt  = {avg_qt:.4f}')
 
-    # Type dividers
-    type_bounds = []
-    last_type = None
-    for i, s in enumerate(scenes):
-        t = 'airport' if 'airport' in s else 'beach' if 'beach' in s else 'urban'
-        if last_type and t != last_type:
-            type_bounds.append(i - 0.5)
-        last_type = t
-    for xb in type_bounds:
-        ax.axvline(xb, color='gray', ls='-', lw=0.8, alpha=0.5)
+    # Annotate best params on float32 bars
+    for i, r in enumerate(valid):
+        bw = r.get('best_winner'); bW = r.get('best_wouter')
+        if bw is not None and bW is not None:
+            ax.text(x[i] - w/2, beta_none[i] + 0.003,
+                    f'w{bw}W{bW}', ha='center', va='bottom',
+                    fontsize=6, rotation=90, color='#333')
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([s.replace('abu-', '') for s in scenes],
-                       rotation=35, ha='right', fontsize=9)
+    _add_type_dividers(ax, scenes, x)
+    ax.set_xticks(x); ax.set_xticklabels(xlabels, rotation=35, ha='right', fontsize=9)
     ax.set_ylabel('AUC-ROC', fontsize=11)
     ax.set_ylim(max(0, min(beta_none + beta_qt) - 0.05), 1.01)
     ax.set_title(
-        f'MAWDBN β  AUC:  float32 vs {QUANTIZATION_MODE.upper()}  |  ABU Dataset',
-        fontsize=12, fontweight='bold',
-    )
+        f'MAWDBN β AUC  —  float32 vs {QUANTIZATION_MODE.upper()}  '
+        f'(best DSW window per scene)  |  ABU Dataset',
+        fontsize=11, fontweight='bold')
     ax.legend(fontsize=9, loc='lower right')
     ax.grid(axis='y', alpha=0.3)
-    plt.tight_layout()
 
+    # ── Panel 2: tuning gain ───────────────────────────────────────────────────
+    if has_fixed:
+        ax2 = axes[1, 0]
+        beta_fixed = [r['auc_beta_none_fixed'] for r in valid]
+
+        ax2.bar(x - w/2, beta_fixed, w, color=colours_fix,
+                edgecolor='white', lw=0.5, label='β float32 (fixed window)')
+        ax2.bar(x + w/2, beta_none,  w, color=colours_none,
+                edgecolor='white', lw=0.5, label='β float32 (best window)')
+
+        avg_fixed = float(np.mean(beta_fixed))
+        ax2.axhline(avg_fixed, color='#888', ls='--', lw=1.5,
+                    label=f'avg fixed = {avg_fixed:.4f}')
+        ax2.axhline(avg_none,  color='#4e79a7', ls='--', lw=1.5,
+                    label=f'avg best  = {avg_none:.4f}')
+
+        # Annotate gain above each pair
+        for i in range(n):
+            gain = beta_none[i] - beta_fixed[i]
+            if abs(gain) > 0.0005:
+                ax2.text(x[i], max(beta_none[i], beta_fixed[i]) + 0.003,
+                         f'{gain:+.3f}', ha='center', va='bottom',
+                         fontsize=7, color='#333')
+
+        _add_type_dividers(ax2, scenes, x)
+        ax2.set_xticks(x); ax2.set_xticklabels(xlabels, rotation=35, ha='right',
+                                                fontsize=9)
+        ax2.set_ylabel('AUC-ROC', fontsize=11)
+        ax2.set_ylim(max(0, min(beta_fixed + beta_none) - 0.05), 1.01)
+        ax2.set_title(
+            'Window Tuning Gain  —  fixed (first combo) vs best (grid search)  '
+            '|  float32 only',
+            fontsize=11, fontweight='bold')
+        ax2.legend(fontsize=9, loc='lower right')
+        ax2.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
     summary_dir  = os.path.join(RESULTS_DIR, 'dbn_abu_qkeras')
     os.makedirs(summary_dir, exist_ok=True)
     chart_path = os.path.join(summary_dir,
@@ -1359,6 +1547,16 @@ def _plot_final_summary(results):
     print(f"  Summary chart -> {chart_path}")
     plt.show()
     plt.close(fig)
+
+
+def _add_type_dividers(ax, scenes, x):
+    """Draw vertical separators between airport / beach / urban groups."""
+    last_type = None
+    for i, s in enumerate(scenes):
+        t = 'airport' if 'airport' in s else 'beach' if 'beach' in s else 'urban'
+        if last_type and t != last_type:
+            ax.axvline(x[i] - 0.5, color='gray', ls='-', lw=0.8, alpha=0.5)
+        last_type = t
 
 
 def run_batch():
