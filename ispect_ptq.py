@@ -18,7 +18,7 @@ Checks:
 USAGE: Set SCENE_INDEX (0-12) and run.
 """
 
-SCENE_INDEX     = 1
+SCENE_INDEX     = 3
 RESULTS_DIR     = 'results/mawdbn_fixed'
 ABU_DATASET_DIR = 'ABU_DATASET'
 N_SAMPLES_TRAIN = 50000
@@ -113,6 +113,53 @@ class TFLiteModel:
             recon[i] = self(norm[i])
         orig = scaler.inverse_transform(recon).astype(np.float32)
         return np.sqrt(np.mean((flat - orig) ** 2, axis=1))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fixed-point multiplier helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def quantise_multiplier(M: float, n_bits: int = 31):
+    """
+    Convert a float scalar M into (int32 multiplier, int shift) such that:
+
+        M ≈ multiplier * 2^(-shift)
+
+    This is the standard TFLite method for eliminating floating-point from
+    the requantisation step.  The approach:
+
+      1. Express M as  mantissa * 2^exponent  where 0.5 <= mantissa < 1.0
+         (i.e. normalise M into the top half of [0,1)).
+      2. Scale mantissa up to an (n_bits)-bit integer:
+             multiplier = round(mantissa * 2^n_bits)
+      3. The shift is then:  shift = n_bits - exponent
+         so that  multiplier * 2^(-shift) = mantissa * 2^exponent = M.
+
+    At inference time the operation is:
+        result = (acc * multiplier) >> shift          # pure integer
+
+    n_bits=31 matches TFLite's own implementation (32-bit signed multiply,
+    top bit reserved for sign, giving 31 usable bits of precision).
+    """
+    if M == 0.0:
+        return 0, 0
+
+    # Decompose M into mantissa in [0.5, 1.0) and a power-of-two exponent.
+    import math
+    exponent = math.floor(math.log2(M))   # M = mantissa * 2^exponent
+    mantissa = M / (2 ** exponent)        # mantissa in [0.5, 1.0)  (or 1.0 exact)
+
+    # Scale mantissa to an n_bits integer
+    multiplier = int(round(mantissa * (2 ** n_bits)))
+
+    # If rounding pushed multiplier to or beyond 2^n_bits, renormalise
+    while multiplier >= (2 ** n_bits):
+        multiplier //= 2
+        exponent   += 1
+
+    shift = n_bits - exponent
+    assert 0 < multiplier < (2 ** n_bits), f"multiplier out of range: {multiplier}"
+    return multiplier, shift
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Track 2 — QuantisedDBN class
@@ -217,6 +264,13 @@ class QuantisedDBN:
         self.M1 = (self.input_scale   * self.enc_w_scale) / self.enc_act_scale
         self.M2 = (self.sigmoid_scale * self.dec_w_scale) / self.output_scale
 
+        # Fixed-point representation of M1 and M2 for T3.
+        # Each float scalar M is expressed as (int32 multiplier, int shift) such that:
+        #   M ≈ multiplier * 2^(-shift)
+        # This allows requantisation using only integer multiply + right-shift.
+        self.M1_mult, self.M1_shift = quantise_multiplier(self.M1)
+        self.M2_mult, self.M2_shift = quantise_multiplier(self.M2)
+
     def _build_sigmoid_lut(self):
         # Index i maps to int8 enc_act value (i - 128).
         # Float value = (enc_act_int8 - enc_act_zp) * enc_act_scale
@@ -319,9 +373,14 @@ def t3_encoder_matmul(inp_q, enc_w, enc_b, input_zp):
             acc[i] += int(enc_w[i, j]) * (int(inp_q[j]) - input_zp)
     return acc.astype(np.int32)
 
-def t3_encoder_requantise(enc_acc, M1, enc_act_zp):
-    q = np.round(enc_acc.astype(np.float64) * M1).astype(np.int64) + enc_act_zp
-    return np.clip(q, -128, 127).astype(np.int8)
+def t3_encoder_requantise(enc_acc, M1_mult, M1_shift, enc_act_zp):
+    # Pure integer requantisation — no floating point.
+    # Computes: round(enc_acc * M1) + enc_act_zp
+    # where M1 = M1_mult * 2^(-M1_shift).
+    # Adding 2^(shift-1) before the right-shift achieves round-to-nearest.
+    half = np.int64(1) << np.int64(M1_shift - 1)
+    q = (enc_acc.astype(np.int64) * np.int64(M1_mult) + half) >> np.int64(M1_shift)
+    return np.clip(q + enc_act_zp, -128, 127).astype(np.int8)
 
 def t3_sigmoid(enc_req, sigmoid_lut, enc_act_zp):
     idx = enc_req.astype(np.int32) + 128
@@ -334,9 +393,10 @@ def t3_decoder_matmul(hidden, dec_w, dec_b, sigmoid_zp):
             acc[i] += int(dec_w[i, j]) * (int(hidden[j]) - sigmoid_zp)
     return acc.astype(np.int32)
 
-def t3_decoder_requantise(dec_acc, M2, output_zp):
-    q = np.round(dec_acc.astype(np.float64) * M2).astype(np.int64) + output_zp
-    return np.clip(q, -128, 127).astype(np.int8)
+def t3_decoder_requantise(dec_acc, M2_mult, M2_shift, output_zp):
+    half = np.int64(1) << np.int64(M2_shift - 1)
+    q = (dec_acc.astype(np.int64) * np.int64(M2_mult) + half) >> np.int64(M2_shift)
+    return np.clip(q + output_zp, -128, 127).astype(np.int8)
 
 def t3_dequantise_output(out_int8, output_scale, output_zp):
     return (out_int8.astype(np.float32) - output_zp) * output_scale
@@ -345,10 +405,10 @@ def t3_forward(pixel_norm, model: QuantisedDBN) -> OrderedDict:
     s = OrderedDict()
     s['input_int8'] = t3_quantise_input(pixel_norm, model.input_scale, model.input_zp)
     s['enc_acc']    = t3_encoder_matmul(s['input_int8'], model.enc_w, model.enc_b, model.input_zp)
-    s['enc_req']    = t3_encoder_requantise(s['enc_acc'], model.M1, model.enc_act_zp)
+    s['enc_req']    = t3_encoder_requantise(s['enc_acc'], model.M1_mult, model.M1_shift, model.enc_act_zp)
     s['hidden']     = t3_sigmoid(s['enc_req'], model.sigmoid_lut, model.enc_act_zp)
     s['dec_acc']    = t3_decoder_matmul(s['hidden'], model.dec_w, model.dec_b, model.sigmoid_zp)
-    s['out_int8']   = t3_decoder_requantise(s['dec_acc'], model.M2, model.output_zp)
+    s['out_int8']   = t3_decoder_requantise(s['dec_acc'], model.M2_mult, model.M2_shift, model.output_zp)
     s['out_f32']    = t3_dequantise_output(s['out_int8'], model.output_scale, model.output_zp)
     return s
 
@@ -358,16 +418,18 @@ def t3_batch(norm, flat, scaler, model: QuantisedDBN) -> np.ndarray:
         -128, 127).astype(np.int8)
     enc_acc = (inp_q.astype(np.int64) - model.input_zp) \
               @ model.enc_w.T.astype(np.int64) + model.enc_b.astype(np.int64)
+    half1   = np.int64(1) << np.int64(model.M1_shift - 1)
     enc_req = np.clip(
-        np.round(enc_acc.astype(np.float64) * model.M1).astype(np.int64) + model.enc_act_zp,
-        -128, 127).astype(np.int8)
+        ((enc_acc.astype(np.int64) * np.int64(model.M1_mult) + half1) >> np.int64(model.M1_shift))
+        + model.enc_act_zp, -128, 127).astype(np.int8)
     hidden  = model.sigmoid_lut[
         enc_req.astype(np.int32) + 128].astype(np.int8)
     dec_acc = (hidden.astype(np.int64) - model.sigmoid_zp) \
               @ model.dec_w.T.astype(np.int64) + model.dec_b.astype(np.int64)
+    half2   = np.int64(1) << np.int64(model.M2_shift - 1)
     out_q   = np.clip(
-        np.round(dec_acc.astype(np.float64) * model.M2).astype(np.int64) + model.output_zp,
-        -128, 127).astype(np.int8)
+        ((dec_acc.astype(np.int64) * np.int64(model.M2_mult) + half2) >> np.int64(model.M2_shift))
+        + model.output_zp, -128, 127).astype(np.int8)
     out_f   = (out_q.astype(np.float32) - model.output_zp) * model.output_scale
     orig    = scaler.inverse_transform(out_f).astype(np.float32)
     return np.sqrt(np.mean((flat - orig) ** 2, axis=1))
@@ -489,10 +551,10 @@ def main():
         # Track 3 — standalone functions called individually
         t3_inp  = t3_quantise_input(px_norm, t2_model.input_scale, t2_model.input_zp)
         t3_eacc = t3_encoder_matmul(t3_inp, t2_model.enc_w, t2_model.enc_b, t2_model.input_zp)
-        t3_ereq = t3_encoder_requantise(t3_eacc, t2_model.M1, t2_model.enc_act_zp)
+        t3_ereq = t3_encoder_requantise(t3_eacc, t2_model.M1_mult, t2_model.M1_shift, t2_model.enc_act_zp)
         t3_hid  = t3_sigmoid(t3_ereq, t2_model.sigmoid_lut, t2_model.enc_act_zp)
         t3_dacc = t3_decoder_matmul(t3_hid, t2_model.dec_w, t2_model.dec_b, t2_model.sigmoid_zp)
-        t3_out8 = t3_decoder_requantise(t3_dacc, t2_model.M2, t2_model.output_zp)
+        t3_out8 = t3_decoder_requantise(t3_dacc, t2_model.M2_mult, t2_model.M2_shift, t2_model.output_zp)
         t3_out  = t3_dequantise_output(t3_out8, t2_model.output_scale, t2_model.output_zp)
 
         t3_rmse = float(np.sqrt(np.mean(
@@ -524,19 +586,23 @@ def main():
     for i in range(N_CHK):
         scalar_out[i] = t3_forward(chk_norm[i], t2_model)['out_f32']
 
-    # Recompute vectorised output for comparison
+    # Recompute vectorised output for comparison (uses T3 fixed-point path)
     _iq  = np.clip(np.round(chk_norm / t2_model.input_scale).astype(np.int64)
                    + t2_model.input_zp, -128, 127).astype(np.int8)
     _ea  = (_iq.astype(np.int64) - t2_model.input_zp) \
            @ t2_model.enc_w.T.astype(np.int64) + t2_model.enc_b.astype(np.int64)
-    _er  = np.clip(np.round(_ea.astype(np.float64) * t2_model.M1).astype(np.int64)
-                   + t2_model.enc_act_zp, -128, 127).astype(np.int8)
+    _h1  = np.int64(1) << np.int64(t2_model.M1_shift - 1)
+    _er  = np.clip(
+           (((_ea.astype(np.int64) * np.int64(t2_model.M1_mult) + _h1) >> np.int64(t2_model.M1_shift))
+           + t2_model.enc_act_zp), -128, 127).astype(np.int8)
     _hq  = t2_model.sigmoid_lut[
            _er.astype(np.int32) + 128].astype(np.int8)
     _da  = (_hq.astype(np.int64) - t2_model.sigmoid_zp) \
            @ t2_model.dec_w.T.astype(np.int64) + t2_model.dec_b.astype(np.int64)
-    _dr  = np.clip(np.round(_da.astype(np.float64) * t2_model.M2).astype(np.int64)
-                   + t2_model.output_zp, -128, 127).astype(np.int8)
+    _h2  = np.int64(1) << np.int64(t2_model.M2_shift - 1)
+    _dr  = np.clip(
+           (((_da.astype(np.int64) * np.int64(t2_model.M2_mult) + _h2) >> np.int64(t2_model.M2_shift))
+           + t2_model.output_zp), -128, 127).astype(np.int8)
     vec_out = (_dr.astype(np.float32) - t2_model.output_zp) * t2_model.output_scale
 
     diff       = np.abs(scalar_out - vec_out)
