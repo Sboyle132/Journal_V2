@@ -15,10 +15,19 @@ Checks:
   T1 == T2  →  class correctly reproduces TFLite inference at every stage
   T2 == T3  →  standalone reimplementation matches the class exactly
 
-USAGE: Set SCENE_INDEX (0-12) and run.
+USAGE:
+  RUN_MODE = 'single'  — run SCENE_INDEX only
+  RUN_MODE = 'all'     — run all 13 ABU scenes in sequence
 """
 
-SCENE_INDEX     = 3
+# ── Mode ──────────────────────────────────────────────────────────────────────
+# 'single' : process only the scene at SCENE_INDEX
+# 'all'    : process all ABU scenes in sequence; per-scene verdicts are printed
+#            and a summary table is shown at the end
+RUN_MODE        = 'all'
+
+
+SCENE_INDEX     = 0
 RESULTS_DIR     = 'results/mawdbn_fixed'
 ABU_DATASET_DIR = 'ABU_DATASET'
 N_SAMPLES_TRAIN = 50000
@@ -472,6 +481,220 @@ def compute_auc(scores, gt):
     return float(roc_auc_score(gt.reshape(-1).astype(int), scores.reshape(-1)))
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Fixed-point export
+# Writes all model parameters in their final integer form to fixed_export/<scene>/
+# ══════════════════════════════════════════════════════════════════════════════
+
+EXPORT_DIR = 'fixed_export'
+
+def export_pixel_intermediates(px_dir: str, label: str, px_idx: int,
+                               model: 'QuantisedDBN', flat: np.ndarray,
+                               scaler: 'StandardScaler'):
+    """
+    Run T3 on one pixel and write every intermediate to px_dir/.
+    Files written (all little-endian):
+      info.json     pixel index, label, per-stage shapes
+      inp_q.bin     int8   [n_input]   quantised input
+      enc_acc.bin   int64  [n_hidden]  encoder matmul accumulator
+      enc_req.bin   int8   [n_hidden]  encoder requantised activation
+      hidden.bin    int8   [n_hidden]  post-sigmoid hidden activations
+      dec_acc.bin   int64  [n_input]   decoder matmul accumulator
+      out_q.bin     int8   [n_input]   dequantised output (int8)
+      out_f32.bin   float32[n_input]   final float32 reconstruction
+      rmse_norm.bin float32[1]         RMSE in normalised space
+      rmse_raw.bin  float32[1]         RMSE in original DN space
+    """
+    import json
+    os.makedirs(px_dir, exist_ok=True)
+
+    px_orig = flat[px_idx].astype(np.float32)
+    px_norm = scaler.transform(px_orig[np.newaxis])[0].astype(np.float32)
+
+    # Run T3 layer by layer
+    inp_q   = t3_quantise_input(px_norm, model.input_scale, model.input_zp)
+    enc_acc = t3_encoder_matmul(inp_q, model.enc_w, model.enc_b, model.input_zp)
+    enc_req = t3_encoder_requantise(enc_acc, model.M1_mult, model.M1_shift, model.enc_act_zp)
+    hidden  = t3_sigmoid(enc_req, model.sigmoid_lut, model.enc_act_zp)
+    dec_acc = t3_decoder_matmul(hidden, model.dec_w, model.dec_b, model.sigmoid_zp)
+    out_q   = t3_decoder_requantise(dec_acc, model.M2_mult, model.M2_shift, model.output_zp)
+    out_f32 = t3_dequantise_output(out_q, model.output_scale, model.output_zp)
+
+    rmse_norm = float(np.sqrt(np.mean((px_norm - out_f32) ** 2)))
+    px_recon  = scaler.inverse_transform(out_f32[np.newaxis])[0].astype(np.float32)
+    rmse_raw  = float(np.sqrt(np.mean((px_orig - px_recon) ** 2)))
+
+    # Write binary intermediates
+    inp_q.astype(np.int8).tofile(      os.path.join(px_dir, 'inp_q.bin'))
+    enc_acc.astype(np.int64).tofile(   os.path.join(px_dir, 'enc_acc.bin'))
+    enc_req.astype(np.int8).tofile(    os.path.join(px_dir, 'enc_req.bin'))
+    hidden.astype(np.int8).tofile(     os.path.join(px_dir, 'hidden.bin'))
+    dec_acc.astype(np.int64).tofile(   os.path.join(px_dir, 'dec_acc.bin'))
+    out_q.astype(np.int8).tofile(      os.path.join(px_dir, 'out_q.bin'))
+    out_f32.astype(np.float32).tofile( os.path.join(px_dir, 'out_f32.bin'))
+    np.array([rmse_norm], dtype=np.float32).tofile(os.path.join(px_dir, 'rmse_norm.bin'))
+    np.array([rmse_raw],  dtype=np.float32).tofile(os.path.join(px_dir, 'rmse_raw.bin'))
+
+    info = {
+        "label":     label,
+        "px_idx":    px_idx,
+        "rmse_norm": rmse_norm,
+        "rmse_raw":  rmse_raw,
+        "shapes": {
+            "inp_q":   {"dtype": "int8",    "shape": [model.n_input]},
+            "enc_acc": {"dtype": "int64",   "shape": [model.n_hidden]},
+            "enc_req": {"dtype": "int8",    "shape": [model.n_hidden]},
+            "hidden":  {"dtype": "int8",    "shape": [model.n_hidden]},
+            "dec_acc": {"dtype": "int64",   "shape": [model.n_input]},
+            "out_q":   {"dtype": "int8",    "shape": [model.n_input]},
+            "out_f32": {"dtype": "float32", "shape": [model.n_input]},
+        }
+    }
+    with open(os.path.join(px_dir, 'info.json'), 'w') as f:
+        json.dump(info, f, indent=2)
+
+    print(f"    {label:<12}  px={px_idx:5d}  "
+          f"RMSE_norm={rmse_norm:.4f}  RMSE_raw={rmse_raw:.2f}")
+
+
+def export_model(scene: str, model: 'QuantisedDBN', image_shape: tuple,
+                 scaler: 'StandardScaler', flat: np.ndarray,
+                 gt_mask: np.ndarray):
+    """
+    Export all parameters and validation data for one scene.
+
+    fixed_export/<scene>/
+      ├── config.json              quant params, image dims, file manifest
+      ├── enc_w.bin                int8   [n_hidden, n_input]
+      ├── enc_b.bin                int32  [n_hidden]
+      ├── dec_w.bin                int8   [n_input,  n_hidden]
+      ├── dec_b.bin                int32  [n_input]
+      ├── sigmoid_lut.bin          int8   [256]
+      ├── scaler_mean.bin          float32[n_bands]
+      ├── scaler_scale.bin         float32[n_bands]
+      └── validation/
+          ├── image_raw.bin        float32[n_pixels, n_bands]  raw DN
+          ├── image_norm.bin       float32[n_pixels, n_bands]  scaler-normalised
+          ├── gt_mask.bin          uint8  [n_pixels]           anomaly GT (0/1)
+          ├── rmse_t3.bin          float32[n_pixels]           T3 per-pixel RMSE
+          ├── px_centre/           intermediates for centre pixel
+          │   ├── info.json
+          │   ├── inp_q.bin  enc_acc.bin  enc_req.bin  hidden.bin
+          │   ├── dec_acc.bin  out_q.bin  out_f32.bin
+          │   └── rmse_norm.bin  rmse_raw.bin
+          └── px_anomaly/          intermediates for median anomaly pixel
+              └── (same layout)
+    """
+    import json
+
+    out_dir = os.path.join(EXPORT_DIR, scene)
+    val_dir = os.path.join(out_dir, 'validation')
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(val_dir, exist_ok=True)
+
+    H, W, C = image_shape
+    N = H * W
+
+    # ── Model parameter files ─────────────────────────────────────────────────
+    model.enc_w.astype(np.int8).tofile(  os.path.join(out_dir, 'enc_w.bin'))
+    model.enc_b.astype(np.int32).tofile( os.path.join(out_dir, 'enc_b.bin'))
+    model.dec_w.astype(np.int8).tofile(  os.path.join(out_dir, 'dec_w.bin'))
+    model.dec_b.astype(np.int32).tofile( os.path.join(out_dir, 'dec_b.bin'))
+    model.sigmoid_lut.astype(np.int8).tofile(os.path.join(out_dir, 'sigmoid_lut.bin'))
+    scaler.mean_.astype(np.float32).tofile( os.path.join(out_dir, 'scaler_mean.bin'))
+    scaler.scale_.astype(np.float32).tofile(os.path.join(out_dir, 'scaler_scale.bin'))
+
+    # ── Config JSON ───────────────────────────────────────────────────────────
+    config = {
+        "scene":    scene,
+        "height":   H,   "width":    W,
+        "n_bands":  C,   "n_pixels": N,
+        "n_input":  model.n_input,
+        "n_hidden": model.n_hidden,
+        "quant": {
+            "input_scale_f32":   float(model.input_scale),
+            "input_zp":          int(model.input_zp),
+            "enc_w_scale_f32":   float(model.enc_w_scale),
+            "enc_act_scale_f32": float(model.enc_act_scale),
+            "enc_act_zp":        int(model.enc_act_zp),
+            "enc_mult":          int(model.M1_mult),
+            "enc_shift":         int(model.M1_shift),
+            "enc_m1_scale_f32":  float(model.M1),
+            "sigmoid_scale_f32": float(model.sigmoid_scale),
+            "sigmoid_zp":        int(model.sigmoid_zp),
+            "dec_w_scale_f32":   float(model.dec_w_scale),
+            "dec_mult":          int(model.M2_mult),
+            "dec_shift":         int(model.M2_shift),
+            "dec_m2_scale_f32":  float(model.M2),
+            "output_scale_f32":  float(model.output_scale),
+            "output_zp":         int(model.output_zp),
+        },
+    }
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # ── Validation: image data ────────────────────────────────────────────────
+    print("  Writing image data...")
+    flat_f32  = flat.astype(np.float32)                               # [N, C]
+    norm_f32  = scaler.transform(flat_f32).astype(np.float32)         # [N, C]
+    flat_f32.tofile( os.path.join(val_dir, 'image_raw.bin'))
+    norm_f32.tofile( os.path.join(val_dir, 'image_norm.bin'))
+
+    # GT mask — zeros if unavailable
+    if gt_mask is not None:
+        gt_flat = gt_mask.reshape(-1).astype(np.uint8)
+    else:
+        gt_flat = np.zeros(N, dtype=np.uint8)
+    gt_flat.tofile(os.path.join(val_dir, 'gt_mask.bin'))
+
+    # ── Validation: T3 full-image RMSE scores ────────────────────────────────
+    print("  Running T3 full-image pass for RMSE export...")
+    rmse_all = t3_batch(norm_f32, flat_f32, scaler, model)     # [N]
+    rmse_all.astype(np.float32).tofile(os.path.join(val_dir, 'rmse_t3.bin'))
+
+    auc_val = None
+    if gt_mask is not None and gt_flat.sum() > 0:
+        from sklearn.metrics import roc_auc_score
+        auc_val = float(roc_auc_score(gt_flat.astype(int), rmse_all))
+        print(f"  T3 full-image AUC: {auc_val:.6f}")
+
+    # ── Validation: per-pixel intermediates ──────────────────────────────────
+    print("  Exporting pixel intermediates...")
+    centre_idx = N // 2
+    export_pixel_intermediates(
+        os.path.join(val_dir, 'px_centre'), 'centre',
+        centre_idx, model, flat, scaler)
+
+    if gt_mask is not None and gt_flat.sum() > 0:
+        pos = np.argwhere(gt_flat)
+        anomaly_idx = int(pos[len(pos) // 2][0])
+        export_pixel_intermediates(
+            os.path.join(val_dir, 'px_anomaly'), 'anomaly',
+            anomaly_idx, model, flat, scaler)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    model_files = ['enc_w.bin', 'enc_b.bin', 'dec_w.bin', 'dec_b.bin',
+                   'sigmoid_lut.bin', 'scaler_mean.bin', 'scaler_scale.bin', 'config.json']
+    val_files   = ['image_raw.bin', 'image_norm.bin', 'gt_mask.bin', 'rmse_t3.bin']
+
+    print(f"\n  Model files ({out_dir}/):")
+    total = 0
+    for fn in model_files:
+        sz = os.path.getsize(os.path.join(out_dir, fn))
+        total += sz
+        print(f"    {fn:<22}  {sz:>9,} bytes")
+
+    print(f"\n  Validation files ({val_dir}/):")
+    for fn in val_files:
+        sz = os.path.getsize(os.path.join(val_dir, fn))
+        total += sz
+        print(f"    {fn:<22}  {sz:>9,} bytes")
+
+    print(f"\n    {'TOTAL':<22}  {total:>9,} bytes")
+    if auc_val is not None:
+        print(f"    T3 AUC (reference):    {auc_val:.6f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -514,6 +737,10 @@ def main():
     print(f"  dec_w_scale={t2_model.dec_w_scale:.6e}")
     print(f"  output_scale={t2_model.output_scale:.6e}   output_zp={t2_model.output_zp}")
     print(f"  M1={t2_model.M1:.6e}  M2={t2_model.M2:.6e}")
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    print_section("FIXED-POINT EXPORT")
+    export_model(scene, t2_model, (H, W, C), scaler, flat, gt_mask)
 
     # ── Single-pixel layer-by-layer ───────────────────────────────────────────
     test_pixels = [('Centre', H * W // 2)]
@@ -687,6 +914,38 @@ def main():
     else:
         print("  ✗ CHECKS FAILED — review mismatches above.")
     print()
+    return all_pass
+
+def main_all():
+    # Run main() for every ABU scene, collect verdicts, print summary
+    import traceback
+    verdicts = []
+    for idx, scene in enumerate(ABU_SCENES):
+        global SCENE_INDEX
+        SCENE_INDEX = idx
+        print(f"\n{'=' * 78}")
+        print(f"  SCENE {idx+1}/{len(ABU_SCENES)}: {scene}")
+        print(f"{'=' * 78}")
+        try:
+            ok = main()
+            verdicts.append((scene, ok))
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            traceback.print_exc()
+            verdicts.append((scene, False))
+
+    print(f"\n{'=' * 78}")
+    print("  ALL-SCENES SUMMARY")
+    print(f"{'=' * 78}")
+    for scene, ok in verdicts:
+        print(f"  {'PASS' if ok else 'FAIL'}  {scene}")
+    passed = sum(1 for _, ok in verdicts if ok)
+    print(f"  {passed}/{len(verdicts)} scenes passed")
+    print(f"{'=' * 78}\n")
+
 
 if __name__ == '__main__':
-    main()
+    if RUN_MODE == 'all':
+        main_all()
+    else:
+        main()
