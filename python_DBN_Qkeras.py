@@ -70,7 +70,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, callbacks, optimizers, losses
 from tensorflow.keras.regularizers import l2 as _l2
-
 try:
     import qkeras
     from qkeras import QDense, QActivation
@@ -543,6 +542,8 @@ def run_scene(scene_name, mat_path):
     else:
         print("  No ground truth — AUC skipped.")
 
+    result['codes_none']  = codes_none
+    result['codes_quant'] = codes_quant
     return result
 
 
@@ -876,6 +877,7 @@ def plot_collective_roc(results):
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
+from mawdbn_dsw_variants import *
 
 if __name__ == '__main__':
     results = []
@@ -885,7 +887,7 @@ if __name__ == '__main__':
             print(f"  {scene}: .mat not found — skipping.")
             continue
         try:
-            results.append(run_scene(scene, mat))
+            results.append(run_scene_variants(scene, mat))
         except Exception as e:
             import traceback
             print(f"  {scene}: FAILED — {e}")
