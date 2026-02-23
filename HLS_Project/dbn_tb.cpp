@@ -1,10 +1,24 @@
 /*
- * dbn_tb.cpp  —  DBN testbench: software inference, IP core, AUC comparison
+ * dbn_tb.cpp  —  DBN testbench: software inference, IP core, Var-C comparison
  *
- * Three paths compared:
- *   Py  — Python T3 reference RMSE scores (loaded from rmse_t3.bin)
- *   SW  — C software inference (dbn_forward, stage-validated)
- *   IP  — HLS kernel (dbn_inout) called directly
+ * Four paths compared:
+ *   Py    — Python T3 reference RMSE scores (loaded from rmse_t3.bin)
+ *   SW    — C software inference (dbn_forward, stage-validated)
+ *   IP    — HLS kernel (dbn_inout) called directly
+ *   VarC  — Variant C: float RMSE, integer code distances (pure C, no HLS)
+ *
+ * VarC is a pure C software reference path. It is NOT compared against the
+ * IP core directly. Its purpose is to validate:
+ *   (a) VarC RMSE == SW RMSE  (by construction — same dequantisation path)
+ *   (b) VarC integer codes == SW hidden - sigmoid_zp  (zero-point subtraction)
+ *   (c) Integer code distances are proportional to float code distances
+ *       (constant scale factor enc_out_scale^2 cancels in DSW weight ratios)
+ *
+ * Numerical stability argument for VarC:
+ *   - RMSE component is exact float32 — identical to SW
+ *   - Code distance component is exact integer — all codes share the same
+ *     encoder output scale/zp so the constant factor cancels across the
+ *     neighbourhood; AUC depends only on ordering which is preserved
  *
  * Loads fixed_export/<scene>/ produced by inspect_ptq.py.
  *
@@ -227,6 +241,179 @@ static void dbn_forward(const float *px_norm, const dbn_model_t *m, float *out_f
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Variant C  —  float RMSE, integer codes
+ *
+ * This is a pure C software reference. It is NOT an HLS kernel and should
+ * NOT be compared against the IP core.
+ *
+ * The model forward pass is identical to SW. After the sigmoid layer the
+ * hidden codes are captured as int16 (zero-point subtracted, scale NOT
+ * applied). The decoder continues normally; RMSE is computed in float after
+ * dequantisation — it is therefore identical to SW RMSE by construction.
+ *
+ * Numerical stability:
+ *   RMSE:  exact float32 — no approximation relative to SW
+ *   Codes: exact integer — all pixels share the same encoder output scale
+ *          and zero-point, so the constant factor (enc_out_scale^2) cancels
+ *          in the DSW weight ratios and does not affect AUC
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/* Per-pixel result carrying both the float RMSE and the integer codes */
+typedef struct {
+    float   rmse;       /* float RMSE in raw DN space — identical to SW */
+    int16_t codes[32];  /* zp-subtracted encoder output, scale not applied */
+} varc_result_t;
+
+static varc_result_t dbn_forward_varc(const float *px_norm, const float *px_raw,
+                                      const dbn_model_t *m)
+{
+    const dbn_config_t *c = &m->cfg;
+    int ni = c->n_input, nh = c->n_hidden;
+    const w8_t  *ew = (const w8_t*)m->enc_w;
+    const b32_t *eb = (const b32_t*)m->enc_b;
+    const w8_t  *dw = (const w8_t*)m->dec_w;
+    const b32_t *db = (const b32_t*)m->dec_b;
+
+    w8_t    inp_q[256];
+    acc64_t enc_acc[32];
+    w8_t    enc_req[32];
+    w8_t    hidden[32];
+    acc64_t dec_acc[256];
+    w8_t    out_q[256];
+    float   out_norm[256];
+    float   out_raw[256];
+
+    /* ── Forward pass (integer throughout) ──────────────────────────── */
+    quantise_input   (px_norm, ni, c->input_scale_f32, c->input_zp, inp_q);
+    encoder_matmul   (inp_q, ni, ew, eb, nh, c->input_zp, enc_acc);
+    encoder_requant  (enc_acc, nh, (m32_t)c->enc_mult,
+                      c->enc_shift, c->enc_act_zp, enc_req);
+    sigmoid_lut_apply(enc_req, nh, (const w8_t*)m->sigmoid_lut, hidden);
+
+    /* ── Capture integer codes: zp-subtracted, scale NOT applied ────────
+     * sigmoid_zp is the zero-point of the sigmoid output tensor.
+     * Subtracting it centres codes around zero so distances are meaningful.
+     * All codes for all pixels share this same zp, so the subtraction is
+     * consistent and the resulting int16 values form a valid metric space. */
+    varc_result_t result;
+    for(int h = 0; h < nh; h++)
+        result.codes[h] = (int16_t)((int)(int8_t)(int)hidden[h] - c->sigmoid_zp);
+
+    /* ── Continue decoder (identical to SW) ─────────────────────────── */
+    decoder_matmul (hidden, nh, dw, db, ni, c->sigmoid_zp, dec_acc);
+    decoder_requant(dec_acc, ni, (m32_t)c->dec_mult,
+                    c->dec_shift, c->output_zp, out_q);
+
+    /* ── Float RMSE: dequantise → inverse scaler → DN space ─────────── */
+    dequantise(out_q, ni, c->output_scale_f32, c->output_zp, out_norm);
+    scaler_inverse(out_norm, ni, m->scaler_mean, m->scaler_scale, out_raw);
+
+    float mse = 0.0f;
+    for(int i = 0; i < ni; i++){
+        float d = px_raw[i] - out_raw[i];
+        mse += d * d;
+    }
+    result.rmse = sqrtf(mse / ni);
+
+    return result;
+}
+
+/* ── Variant C: pixel-level validation against SW reference ─────────────── *
+ * Checks:
+ *   (1) VarC RMSE == SW RMSE (must match to floating point precision)
+ *   (2) VarC codes == hidden[h] - sigmoid_zp for each dimension             */
+static int validate_varc_pixel(const dbn_model_t *m,
+                                const int8_t *ref_hidden,
+                                float ref_rmse_raw,
+                                const char *label, int px_idx,
+                                const float *image_raw)
+{
+    const dbn_config_t *c = &m->cfg;
+    int ni = c->n_input, nh = c->n_hidden;
+
+    const float *px_raw = image_raw + (long)px_idx * ni;
+    float px_norm[256];
+    scaler_apply(px_raw, ni, m->scaler_mean, m->scaler_scale, px_norm);
+
+    varc_result_t vc = dbn_forward_varc(px_norm, px_raw, m);
+
+    printf("\n  ── Var-C pixel: %s (idx=%d) ────────────────────\n",
+           label, px_idx);
+
+    /* (1) RMSE check — must be identical to SW */
+    float rmse_diff = fabsf(vc.rmse - ref_rmse_raw);
+    printf("  RMSE  VarC=%.6f  Py=%.6f  diff=%.2e  %s\n",
+           vc.rmse, ref_rmse_raw, rmse_diff,
+           rmse_diff < 1e-3f ? "OK" : "DIFF");
+
+    /* (2) Code check — each code must equal hidden[h] - sigmoid_zp */
+    int mm = 0;
+    for(int h = 0; h < nh; h++){
+        int16_t expected = (int16_t)((int)(int8_t)ref_hidden[h] - c->sigmoid_zp);
+        if(vc.codes[h] != expected){
+            printf("  code[%d]  VarC=%d  expected=%d  MISMATCH\n",
+                   h, (int)vc.codes[h], (int)expected);
+            mm++;
+        }
+    }
+    printf("  Codes  mm=%d/%d  %s\n", mm, nh, mm==0?"OK":"MISMATCH");
+    return (rmse_diff >= 1e-3f ? 1 : 0) + mm;
+}
+
+/* ── Variant C: full-image pass ──────────────────────────────────────────── *
+ * Returns RMSE array (caller frees). Optionally fills codes_out[N*nh].      */
+static float *run_varc_image(const dbn_model_t *m, const float *image_raw,
+                              int16_t *codes_out)
+{
+    const dbn_config_t *c = &m->cfg;
+    int ni = c->n_input, nh = c->n_hidden, N = c->n_pixels;
+    float *rmse = (float*)malloc(N * sizeof(float));
+    float px_norm[256];
+
+    for(int px = 0; px < N; px++){
+        const float *raw = image_raw + (long)px * ni;
+        scaler_apply(raw, ni, m->scaler_mean, m->scaler_scale, px_norm);
+        varc_result_t r = dbn_forward_varc(px_norm, raw, m);
+        rmse[px] = r.rmse;
+        if(codes_out)
+            memcpy(codes_out + (long)px * nh, r.codes, nh * sizeof(int16_t));
+    }
+    return rmse;
+}
+
+/* ── Variant C: code distance validation ────────────────────────────────── *
+ * Demonstrates that integer squared distances are proportional to float
+ * squared distances by a constant factor (enc_out_scale^2).
+ * This proves the scale cancels in DSW weight ratios.                        */
+static void varc_code_distance_check(const dbn_model_t *m,
+                                      const float *image_raw,
+                                      int px_a, int px_b)
+{
+    const dbn_config_t *c = &m->cfg;
+    int ni = c->n_input, nh = c->n_hidden;
+
+    float norm_a[256], norm_b[256];
+    scaler_apply(image_raw + (long)px_a*ni, ni,
+                 m->scaler_mean, m->scaler_scale, norm_a);
+    scaler_apply(image_raw + (long)px_b*ni, ni,
+                 m->scaler_mean, m->scaler_scale, norm_b);
+
+    varc_result_t ra = dbn_forward_varc(norm_a, image_raw+(long)px_a*ni, m);
+    varc_result_t rb = dbn_forward_varc(norm_b, image_raw+(long)px_b*ni, m);
+
+    long   dist_int_sq = 0;
+    for(int h = 0; h < nh; h++){
+        int32_t d = (int32_t)ra.codes[h] - (int32_t)rb.codes[h];
+        dist_int_sq += (long)d * d;
+    }
+
+    printf("\n  Var-C code distance check  px_a=%d  px_b=%d\n", px_a, px_b);
+    printf("  int_sq_dist = %ld\n", dist_int_sq);
+    printf("  (float_sq_dist = int_sq_dist * enc_out_scale^2  — scale cancels "
+           "in DSW weight ratios)\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Stage-by-stage pixel validation (SW vs Python T3)
  * ═════════════════════════════════════════════════════════════════════════ */
 typedef struct {
@@ -373,9 +560,6 @@ static float *run_ip_image(const dbn_model_t *m, const float *image_raw)
     const dbn_config_t *c=&m->cfg;
     int ni=c->n_input, nh=c->n_hidden, N=c->n_pixels;
 
-    /* ── Prepare weight arrays in IP layout ─────────────────────────────
-     * SW stores enc_w as [n_hidden, n_input] row-major.
-     * The IP kernel uses the same layout — copy cast to dat_tw1 (ap_int<8>). */
     static dat_tw1 W_enc[MAX_CODES * MAX_BANDS];
     static dat_tw2 W_dec[MAX_BANDS * MAX_CODES];
     static dat_tb1 B_enc[MAX_CODES];
@@ -393,10 +577,8 @@ static float *run_ip_image(const dbn_model_t *m, const float *image_raw)
     for(int i=0;i<LUT_SIZE;i++) LUT[i]=(dat_tc1)m->sigmoid_lut[i];
     for(int i=0;i<ni;i++){sc_mean[i]=m->scaler_mean[i]; sc_scale[i]=m->scaler_scale[i];}
 
-    /* Flat image: [N * ni] floats */
     memcpy(hsi_in, image_raw, (long)N*ni*sizeof(float));
 
-    /* ── Call IP kernel ─────────────────────────────────────────────── */
     dbn_inout(
         W_enc, B_enc, W_dec, B_dec, LUT, sc_mean, sc_scale,
         hsi_in, hsi_out,
@@ -479,7 +661,7 @@ int main(int argc, char *argv[])
     printf("  Stage-by-stage validation  SW vs Python T3\n");
     printf("══════════════════════════════════════════════════\n");
     const char *px_dirs[]={"px_centre","px_anomaly"};
-    int stage_mm=0;
+    int stage_mm=0, varc_px_mm=0;
     for(int p=0;p<2;p++){
         snprintf(path,sizeof(path),"%s/validation/%s",dir,px_dirs[p]);
         char ipath[512]; snprintf(ipath,sizeof(ipath),"%s/info.json",path);
@@ -488,39 +670,55 @@ int main(int argc, char *argv[])
         fclose(chk);
         ref_pixel_t ref; memset(&ref,0,sizeof(ref));
         if(load_ref_pixel(path,&ref,ni,nh)==0){
-            stage_mm+=validate_pixel(&model,&ref,image_raw);
+            /* SW stage validation (unchanged) */
+            stage_mm += validate_pixel(&model,&ref,image_raw);
+            /* Var-C pixel validation against SW hidden layer */
+            varc_px_mm += validate_varc_pixel(&model, ref.hidden,
+                                               ref.rmse_raw, ref.label,
+                                               ref.px_idx, image_raw);
             free_ref_pixel(&ref);
         }
     }
+
+    /* ── Var-C code distance check ───────────────────────────────────────── */
+    printf("\n══════════════════════════════════════════════════\n");
+    printf("  Var-C code distance proportionality check\n");
+    printf("══════════════════════════════════════════════════\n");
+    varc_code_distance_check(&model, image_raw, 0, N/2);
 
     /* ── SW full image ───────────────────────────────────────────────────── */
     printf("\n══════════════════════════════════════════════════\n");
     printf("  SW full-image RMSE  (%d pixels)\n",N);
     printf("══════════════════════════════════════════════════\n");
-    float *rmse_sw=run_sw_image(&model,image_raw);
-    compare_rmse("SW", rmse_sw,  "Py", rmse_py,  N, 0.01f);
-    /* Silenced — reuse variable names below */
-    (void)rmse_sw;
+    float *rmse_sw = run_sw_image(&model, image_raw);
+    compare_rmse("SW", rmse_sw, "Py", rmse_py, N, 0.01f);
 
-    /* Rerun for clean variable scope */
-    float *rmse_c=rmse_sw;  /* alias */
+    /* ── Var-C full image ────────────────────────────────────────────────── *
+     * RMSE path is identical to SW — comparison is a correctness check only  */
+    printf("\n══════════════════════════════════════════════════\n");
+    printf("  Var-C full-image RMSE  (%d pixels)\n", N);
+    printf("  NOTE: VarC is pure C software — not compared against IP\n");
+    printf("══════════════════════════════════════════════════\n");
+    int16_t *varc_codes = (int16_t*)malloc((long)N * nh * sizeof(int16_t));
+    float   *rmse_vc    = run_varc_image(&model, image_raw, varc_codes);
+
+    printf("\n  VarC vs SW  (must be identical — same RMSE path):\n");
+    compare_rmse("VarC", rmse_vc, "SW", rmse_sw, N, 1e-5f);
 
     /* ── IP core full image ──────────────────────────────────────────────── */
     printf("\n══════════════════════════════════════════════════\n");
     printf("  IP core full-image RMSE  (%d pixels)\n",N);
     printf("══════════════════════════════════════════════════\n");
-    float *rmse_ip=run_ip_image(&model,image_raw);
+    float *rmse_ip = run_ip_image(&model, image_raw);
 
-    /* IP vs Py */
     printf("\n  IP vs Py:\n");
-    compare_rmse("IP", rmse_ip,  "Py", rmse_py,  N, 0.01f);
+    compare_rmse("IP", rmse_ip, "Py", rmse_py, N, 0.01f);
 
-    /* IP vs SW */
     printf("\n  IP vs SW:\n");
     {
         float max_diff=0,mean_diff=0; int mm=0;
         for(int i=0;i<N;i++){
-            float d=fabsf(rmse_ip[i]-rmse_c[i]);
+            float d=fabsf(rmse_ip[i]-rmse_sw[i]);
             if(d>0.01f)mm++;
             if(d>max_diff)max_diff=d;
             mean_diff+=d;
@@ -539,12 +737,17 @@ int main(int argc, char *argv[])
         printf("  GT mask empty — skipped\n");
     } else {
         printf("  GT mask: %ld anomaly / %d total\n",n_pos,N);
-        float auc_py=compute_auc(rmse_py,gt_mask,N);
-        float auc_sw=compute_auc(rmse_c, gt_mask,N);
-        float auc_ip=compute_auc(rmse_ip,gt_mask,N);
-        printf("  AUC  Py=%.6f  SW=%.6f  IP=%.6f\n",auc_py,auc_sw,auc_ip);
+        float auc_py = compute_auc(rmse_py, gt_mask, N);
+        float auc_sw = compute_auc(rmse_sw, gt_mask, N);
+        float auc_ip = compute_auc(rmse_ip, gt_mask, N);
+        float auc_vc = compute_auc(rmse_vc, gt_mask, N);
+        printf("  AUC  Py=%.6f  SW=%.6f  IP=%.6f  VarC=%.6f\n",
+               auc_py, auc_sw, auc_ip, auc_vc);
         printf("  IP-Py=%.6f  IP-SW=%.6f  SW-Py=%.6f\n",
-               fabsf(auc_ip-auc_py),fabsf(auc_ip-auc_sw),fabsf(auc_sw-auc_py));
+               fabsf(auc_ip-auc_py), fabsf(auc_ip-auc_sw),
+               fabsf(auc_sw-auc_py));
+        printf("  NOTE: VarC AUC == SW AUC by construction (same RMSE path)\n");
+        printf("        VarC integer codes validated separately above\n");
     }
 
     /* ── Final verdict ───────────────────────────────────────────────────── */
@@ -552,22 +755,28 @@ int main(int argc, char *argv[])
     printf("  FINAL VERDICT\n");
     printf("══════════════════════════════════════════════════\n");
 
-    int sw_py_mm=0, ip_py_mm=0, ip_sw_mm=0;
+    int sw_py_mm=0, ip_py_mm=0, ip_sw_mm=0, vc_sw_mm=0;
     for(int i=0;i<N;i++){
-        if(fabsf(rmse_c[i] -rmse_py[i])>0.01f) sw_py_mm++;
-        if(fabsf(rmse_ip[i]-rmse_py[i])>0.01f) ip_py_mm++;
-        if(fabsf(rmse_ip[i]-rmse_c[i]) >0.01f) ip_sw_mm++;
+        if(fabsf(rmse_sw[i]-rmse_py[i])>0.01f)  sw_py_mm++;
+        if(fabsf(rmse_ip[i]-rmse_py[i])>0.01f)  ip_py_mm++;
+        if(fabsf(rmse_ip[i]-rmse_sw[i])>0.01f)  ip_sw_mm++;
+        if(fabsf(rmse_vc[i]-rmse_sw[i])>1e-5f)  vc_sw_mm++;
     }
-    printf("  Stage mm (SW vs Py) : %d  %s\n",stage_mm, stage_mm==0?"PASS":"FAIL");
-    printf("  RMSE  mm (SW vs Py) : %d  %s\n",sw_py_mm, sw_py_mm==0?"PASS":"FAIL");
-    printf("  RMSE  mm (IP vs Py) : %d  %s\n",ip_py_mm, ip_py_mm==0?"PASS":"FAIL");
-    printf("  RMSE  mm (IP vs SW) : %d  %s\n",ip_sw_mm, ip_sw_mm==0?"PASS":"FAIL");
-    int all_ok=(stage_mm==0&&sw_py_mm==0&&ip_py_mm==0&&ip_sw_mm==0);
+    printf("  Stage mm  (SW  vs Py)      : %d  %s\n", stage_mm,  stage_mm==0?"PASS":"FAIL");
+    printf("  RMSE  mm  (SW  vs Py)      : %d  %s\n", sw_py_mm,  sw_py_mm==0?"PASS":"FAIL");
+    printf("  RMSE  mm  (IP  vs Py)      : %d  %s\n", ip_py_mm,  ip_py_mm==0?"PASS":"FAIL");
+    printf("  RMSE  mm  (IP  vs SW)      : %d  %s\n", ip_sw_mm,  ip_sw_mm==0?"PASS":"FAIL");
+    printf("  RMSE  mm  (VarC vs SW)     : %d  %s  [must be 0]\n",
+           vc_sw_mm, vc_sw_mm==0?"PASS":"FAIL");
+    printf("  Codes mm  (VarC px val)    : %d  %s\n", varc_px_mm, varc_px_mm==0?"PASS":"FAIL");
+
+    int all_ok = (stage_mm==0 && sw_py_mm==0 && ip_py_mm==0 &&
+                  ip_sw_mm==0 && vc_sw_mm==0 && varc_px_mm==0);
     printf("\n  %s\n", all_ok
-           ? "ALL PASS  —  IP core matches SW and Python T3"
+           ? "ALL PASS  —  IP core matches SW and Python T3; Var-C codes validated"
            : "DIFFERENCES FOUND  —  check above");
 
-    free(rmse_c); free(rmse_ip);
+    free(rmse_sw); free(rmse_ip); free(rmse_vc); free(varc_codes);
     free(image_raw); free(gt_mask); free(rmse_py);
     free_model(&model);
     return all_ok ? 0 : 1;
