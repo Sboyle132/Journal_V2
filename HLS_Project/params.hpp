@@ -1,4 +1,3 @@
-#pragma once
 #ifndef params_h
 #define params_h
 
@@ -6,17 +5,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-/* ── Utility ─────────────────────────────────────────────────────────────── */
 #ifndef CEILING
 #define CEILING(x,y) (((x) + (y) - 1) / (y))
 #endif
 
-/* ── Scene: abu-airport-1 ────────────────────────────────────────────────── */
-#define MAX_BANDS   205
+/* ── Scene dimensions ────────────────────────────────────────────────────── */
+#define MAX_BANDS   120     /* PCA-reduced; matches HYPSO native band count  */
 #define MAX_CODES   13
 #define MAX_WIDTH   100
 #define MAX_HEIGHT  100
-#define IN_SIZE     1   /* bands streamed per beat; raise for throughput */
+#define IN_SIZE     1
 
 /* ── Derived ─────────────────────────────────────────────────────────────── */
 #define MAX_READS   CEILING(MAX_BANDS, IN_SIZE)
@@ -25,5 +23,8 @@
 
 /* ── Sigmoid LUT ─────────────────────────────────────────────────────────── */
 #define LUT_SIZE    256
+
+/* ── Scaler ROM — StandardScaler parameters baked in at synthesis time ───── */
+#include "scaler_rom.hpp"
 
 #endif /* params_h */

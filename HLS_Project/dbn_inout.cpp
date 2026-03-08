@@ -3,22 +3,34 @@
  *
  * Top function: dbn_inout()
  * Mirrors the structure of the float hsi_inout() kernel exactly:
- *   load_weights  → load_bram → load_input → encDec → store_result
+ *   load_weights  -> load_bram -> load_input -> encDec -> store_result
  *
- * Integer arithmetic throughout the network (int8 weights, int64 accumulators,
+ * Integer arithmetic throughout the network (int8 weights, int32 accumulators,
  * fixed-point multiply-shift requantisation, int8 LUT sigmoid).
- * Float only at the boundary: scaler normalisation on input,
- * dequantise + inverse-scale + RMSE on output.
+ * Float only at the boundary: scaler normalisation on input (ROM constants),
+ * dequantise + RMSE on output.
  *
- * All pragma names and loop labels follow the original conventions.
+ * Scaler parameters (SCALER_MEAN, SCALER_SCALE) are compile-time ROM constants
+ * from scaler_rom.hpp — no AXI port, no BRAM load, HLS sees them at synthesis.
+ *
+ * Types follow TFLite int8 PTQ spec exactly:
+ *   dat_tacc  ap_int<32>   accumulator
+ *   dat_tmul  ap_uint<32>  requantise multiplier
+ *   zp args   ap_int<8>    zero points
+ *   shift args ap_uint<8>  shift values
+ *   height/width ap_uint<16>
+ *   requantise intermediate ap_int<64> local only — 32x32->64, shift back to 32
+ *
+ * RMSE convention: normalised space (px_norm - recon_norm).
+ *   After PCA + StandardScaler each band has unit variance; normalised RMSE
+ *   weights all components equally and matches the Python T3 reference scores.
  */
 
 #include "dbn_inout.hpp"
 
 /* ══════════════════════════════════════════════════════════════════════════
  * IO — load weights into on-chip BRAM
- * Same pattern as original load_weights()
- * ════════════════════════════════════════════════════════════════════════ */
+ * ══════════════════════════════════════════════════════════════════════════ */
 static void load_weights(
     dat_tw1 W_enc[MAX_CODES * MAX_BANDS],
     dat_tw2 W_dec[MAX_BANDS * MAX_CODES],
@@ -33,21 +45,16 @@ load_weights:
     }
 }
 
-/* ── Load biases + LUT + scaler into on-chip BRAM ───────────────────────
- * Extends the original load_bram() to also bring in LUT and scaler.
- * These are small enough to sit entirely on-chip for the duration.
- * ──────────────────────────────────────────────────────────────────────── */
+/* ── Load biases + LUT into on-chip BRAM ────────────────────────────────────
+ * Scaler is now a ROM (scaler_rom.hpp) — no load needed.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void load_bram(
     dat_tb1  B_enc[MAX_CODES],
     dat_tb2  B_dec[MAX_BANDS],
     dat_tc1  LUT[LUT_SIZE],
-    float    scaler_mean[MAX_BANDS],
-    float    scaler_scale[MAX_BANDS],
     dat_tb1  B_enc_i[MAX_CODES],
     dat_tb2  B_dec_i[MAX_BANDS],
-    dat_tc1  LUT_i[LUT_SIZE],
-    float    sc_mean_i[MAX_BANDS],
-    float    sc_scale_i[MAX_BANDS])
+    dat_tc1  LUT_i[LUT_SIZE])
 {
 load_B_enc:
     for (int i = 0; i < MAX_CODES; i++) {
@@ -64,23 +71,15 @@ load_LUT:
         #pragma HLS PIPELINE
         LUT_i[i] = LUT[i];
     }
-load_scaler:
-    for (int i = 0; i < MAX_BANDS; i++) {
-        #pragma HLS PIPELINE
-        sc_mean_i[i]  = scaler_mean[i];
-        sc_scale_i[i] = scaler_scale[i];
-    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
  * IO — stream input pixels
- * Same as original load_input() but reads flat float array [H*W*bands]
- * row-major. Streams one float per beat (IN_SIZE=1).
- * ════════════════════════════════════════════════════════════════════════ */
+ * ══════════════════════════════════════════════════════════════════════════ */
 static void load_input(
     float                hsi_in[BUFFER_SIZE],
     hls::stream<float>  &inStream,
-    int height, int width)
+    ap_uint<16> height, ap_uint<16> width)
 {
 stream_in:
     for (int i = 0; i < width * height * MAX_BANDS; i++) {
@@ -92,12 +91,11 @@ stream_in:
 
 /* ══════════════════════════════════════════════════════════════════════════
  * IO — store RMSE results
- * Same as original store_result()
- * ════════════════════════════════════════════════════════════════════════ */
+ * ══════════════════════════════════════════════════════════════════════════ */
 static void store_result(
     dat_tre              SCORE[BUFFER_OUT],
     hls::stream<dat_tre> &score_stream,
-    int height, int width)
+    ap_uint<16> height, ap_uint<16> width)
 {
 mem_wr:
     for (int i = 0; i < width * height; i++) {
@@ -109,53 +107,59 @@ mem_wr:
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Autoencoder pipeline
- * Mirrors original encDec() structure:
- *   read_pixels → encode_layer → decode_layer
- * ════════════════════════════════════════════════════════════════════════ */
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 /* ── read_pixels
- * Reads one pixel (MAX_BANDS floats) from stream, applies StandardScaler,
- * stores normalised result in pix[]. Keeps a raw copy in pix_raw[] for
- * the RMSE calculation after reconstruction.
- * ──────────────────────────────────────────────────────────────────────── */
+ * Reads one pixel (MAX_BANDS floats) from stream, applies StandardScaler
+ * using ROM constants SCALER_MEAN / SCALER_SCALE from scaler_rom.hpp.
+ * Output is normalised pixel only — raw copy no longer needed since RMSE
+ * is computed in normalised space.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void read_pixels(
     float               pix_norm[MAX_BANDS],
-    float               pix_raw [MAX_BANDS],
-    hls::stream<float> &hsi_in,
-    float               sc_mean [MAX_BANDS],
-    float               sc_scale[MAX_BANDS])
+    hls::stream<float> &hsi_in)
 {
 read_outer:
     for (int r = 0; r < MAX_BANDS; r++) {
         #pragma HLS loop_tripcount max=MAX_BANDS
         #pragma HLS PIPELINE
-        float raw      = hsi_in.read();
-        pix_raw[r]     = raw;
-        pix_norm[r]    = (raw - sc_mean[r]) / sc_scale[r];
+        float raw   = hsi_in.read();
+        pix_norm[r] = (raw - SCALER_MEAN[r]) / SCALER_SCALE[r];
     }
 }
 
+/* ── requantise
+ * TFLite multiply-shift pattern.
+ * acc is int32, mult is uint32.
+ * Intermediate product needs int64 — local only, not loop-carried.
+ * Maps to 2 DSP48s. Result clipped to int8.
+ * ─────────────────────────────────────────────────────────────────────────── */
+static ap_int<8> requantise(dat_tacc acc, ap_uint<32> mult, ap_uint<8> shift, ap_int<8> zp)
+{
+    #pragma HLS INLINE
+    ap_int<64> product = (ap_int<64>)acc * (ap_int<64>)mult;
+    ap_int<64> rounded = (product + ((ap_int<64>)1 << (shift - 1))) >> shift;
+    ap_int<32> result  = (ap_int<32>)rounded + (ap_int<32>)zp;
+    if      (result >  127) result =  127;
+    else if (result < -128) result = -128;
+    return (ap_int<8>)result;
+}
+
 /* ── encode_layer
- * Integer matmul + fixed-point requantise + LUT sigmoid.
- * Replaces the float sigmoid in the original encode_layer().
- *
- *   acc[j] = B_enc[j] + sum_k( W_enc[k*MAX_CODES+j] * (pix_norm_q[k] - input_zp) )
- *   enc_req = clip( ((acc * enc_mult + 2^(enc_shift-1)) >> enc_shift) + enc_act_zp )
- *   H1[j]  = LUT[ enc_req + 128 ]
- * ──────────────────────────────────────────────────────────────────────── */
+ * Integer matmul (int32 acc) + requantise + LUT sigmoid.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void encode_layer(
     float       pix_norm[MAX_BANDS],
     dat_tc1     H1[MAX_CODES],
     dat_tw1     W_enc[MAX_CODES * MAX_BANDS],
     dat_tb1     B_enc[MAX_CODES],
     dat_tc1     LUT[LUT_SIZE],
-    float       input_scale,
-    int         input_zp,
-    ap_uint<32> enc_mult,
-    int         enc_shift,
-    int         enc_act_zp)
+    float        input_scale,
+    ap_int<8>    input_zp,
+    ap_uint<32>  enc_mult,
+    ap_uint<8>   enc_shift,
+    ap_int<8>    enc_act_zp)
 {
-    /* Step 1: quantise input pixel to int8 */
     ap_int<8> inp_q[MAX_BANDS];
     #pragma HLS ARRAY_PARTITION variable=inp_q complete
 quantise_input:
@@ -168,7 +172,6 @@ quantise_input:
         inp_q[k] = (ap_int<8>)q;
     }
 
-    /* Step 2: matmul + requantise + LUT */
 RBM1_exterior:
     for (int j = 0; j < MAX_CODES; j++) {
         #pragma HLS loop_tripcount max=MAX_CODES
@@ -179,44 +182,27 @@ RBM1_interior:
             acc += (dat_tacc)W_enc[j * MAX_BANDS + k]
                  * ((dat_tacc)inp_q[k] - (dat_tacc)input_zp);
         }
-
-        /* fixed-point requantise */
-        ap_int<64> product = (ap_int<64>)acc * (ap_int<64>)(ap_uint<32>)enc_mult;
-        ap_int<64> half    = (ap_int<64>)1 << (enc_shift - 1);
-        ap_int<64> rounded = (product + half) >> enc_shift;
-        ap_int<64> result  = rounded + (ap_int<64>)enc_act_zp;
-        if      (result >  127) result =  127;
-        else if (result < -128) result = -128;
-        ap_int<8> enc_req = (ap_int<8>)result;
-
-        /* sigmoid via LUT — index = enc_req + 128 maps [-128,127] -> [0,255] */
+        ap_int<8> enc_req = requantise(acc, enc_mult, enc_shift, enc_act_zp);
         H1[j] = LUT[(int)enc_req + 128];
     }
 }
 
 /* ── decode_layer
- * Integer matmul + fixed-point requantise → int8 reconstruction.
- * Dequantise and inverse-scale to raw DN, then compute RMSE vs original.
- * Writes one float RMSE score to hsi_out stream.
- *
- *   acc[m] = B_dec[m] + sum_n( W_dec[m*MAX_CODES+n] * (H1[n] - sigmoid_zp) )
- *   out_q  = clip( ((acc * dec_mult + 2^(dec_shift-1)) >> dec_shift) + output_zp )
- *   recon  = (out_q - output_zp) * output_scale * sc_scale[m] + sc_mean[m]
- *   RMSE   = sqrt( mean( (raw - recon)^2 ) )
- * ──────────────────────────────────────────────────────────────────────── */
+ * Integer matmul (int32 acc) + requantise -> int8 reconstruction.
+ * Dequantise to normalised space, compute RMSE vs normalised input pixel.
+ * Writes one float score to stream.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void decode_layer(
     dat_tc1              H1[MAX_CODES],
-    float                pix_raw[MAX_BANDS],
+    float                pix_norm[MAX_BANDS],
     hls::stream<dat_tre> &hsi_out,
     dat_tw2              W_dec[MAX_BANDS * MAX_CODES],
     dat_tb2              B_dec[MAX_BANDS],
-    float                sc_mean[MAX_BANDS],
-    float                sc_scale[MAX_BANDS],
-    int                  sigmoid_zp,
+    ap_int<8>            sigmoid_zp,
     ap_uint<32>          dec_mult,
-    int                  dec_shift,
+    ap_uint<8>           dec_shift,
     float                output_scale,
-    int                  output_zp)
+    ap_int<8>            output_zp)
 {
     float score = 0.0f;
 
@@ -232,21 +218,11 @@ RBM2_interior:
                  * ((dat_tacc)H1[n] - (dat_tacc)sigmoid_zp);
         }
 
-        /* fixed-point requantise */
-        ap_int<64> product = (ap_int<64>)acc * (ap_int<64>)(ap_uint<32>)dec_mult;
-        ap_int<64> half    = (ap_int<64>)1 << (dec_shift - 1);
-        ap_int<64> rounded = (product + half) >> dec_shift;
-        ap_int<64> result  = rounded + (ap_int<64>)output_zp;
-        if      (result >  127) result =  127;
-        else if (result < -128) result = -128;
-        ap_int<8> out_q = (ap_int<8>)result;
+        ap_int<8> out_q = requantise(acc, dec_mult, dec_shift, output_zp);
 
-        /* dequantise to normalised space, then inverse-scale to raw DN */
+        /* dequantise to normalised space, compute diff vs normalised input */
         float recon_norm = ((float)(int)out_q - (float)output_zp) * output_scale;
-        float recon_raw  = recon_norm * sc_scale[m] + sc_mean[m];
-
-        /* accumulate squared error */
-        float diff = pix_raw[m] - recon_raw;
+        float diff = pix_norm[m] - recon_norm;
         score += diff * diff;
     }
 
@@ -255,97 +231,80 @@ RBM2_interior:
 }
 
 /* ── encDec
- * Pixel loop — same structure as original encDec().
- * Loads weights/biases/LUT/scaler into local BRAM, then processes
- * each pixel: read → encode → decode → emit score.
- * ──────────────────────────────────────────────────────────────────────── */
+ * Pixel loop.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void encDec(
     dat_tw1              W_enc[MAX_CODES * MAX_BANDS],
     dat_tw2              W_dec[MAX_BANDS * MAX_CODES],
     dat_tb1              B_enc[MAX_CODES],
     dat_tb2              B_dec[MAX_BANDS],
     dat_tc1              LUT[LUT_SIZE],
-    float                sc_mean[MAX_BANDS],
-    float                sc_scale[MAX_BANDS],
     hls::stream<float>  &hsi_in,
     hls::stream<dat_tre> &hsi_out,
-    int height, int width,
-    float input_scale, int input_zp,
-    ap_uint<32> enc_mult, int enc_shift, int enc_act_zp,
-    int sigmoid_zp,
-    ap_uint<32> dec_mult, int dec_shift,
-    float output_scale, int output_zp)
+    ap_uint<16> height, ap_uint<16> width,
+    float input_scale, ap_int<8> input_zp,
+    ap_uint<32> enc_mult, ap_uint<8> enc_shift, ap_int<8> enc_act_zp,
+    ap_int<8> sigmoid_zp,
+    ap_uint<32> dec_mult, ap_uint<8> dec_shift,
+    float output_scale, ap_int<8> output_zp)
 {
-    /* On-chip buffers */
     float    pix_norm[MAX_BANDS];
-    float    pix_raw [MAX_BANDS];
     dat_tc1  H1[MAX_CODES];
     dat_tw1  W_enc_i[MAX_CODES * MAX_BANDS];
     dat_tw2  W_dec_i[MAX_BANDS * MAX_CODES];
     dat_tb1  B_enc_i[MAX_CODES];
     dat_tb2  B_dec_i[MAX_BANDS];
     dat_tc1  LUT_i[LUT_SIZE];
-    float    sc_mean_i[MAX_BANDS];
-    float    sc_scale_i[MAX_BANDS];
 
     load_weights(W_enc, W_dec, W_enc_i, W_dec_i);
-    load_bram(B_enc, B_dec, LUT, sc_mean, sc_scale,
-              B_enc_i, B_dec_i, LUT_i, sc_mean_i, sc_scale_i);
+    load_bram(B_enc, B_dec, LUT, B_enc_i, B_dec_i, LUT_i);
 
 HSI_AD_LOOP:
     for (int i = 0; i < width * height; i++) {
         #pragma HLS loop_tripcount max=MAX_WIDTH*MAX_HEIGHT
 
-        read_pixels (pix_norm, pix_raw, hsi_in, sc_mean_i, sc_scale_i);
+        read_pixels (pix_norm, hsi_in);
         encode_layer(pix_norm, H1, W_enc_i, B_enc_i, LUT_i,
                      input_scale, input_zp, enc_mult, enc_shift, enc_act_zp);
-        decode_layer(H1, pix_raw, hsi_out, W_dec_i, B_dec_i,
-                     sc_mean_i, sc_scale_i,
+        decode_layer(H1, pix_norm, hsi_out, W_dec_i, B_dec_i,
                      sigmoid_zp, dec_mult, dec_shift, output_scale, output_zp);
     }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Top function
- * ════════════════════════════════════════════════════════════════════════ */
+ * ══════════════════════════════════════════════════════════════════════════ */
 void dbn_inout(
-    dat_tw1  W_enc [MAX_CODES * MAX_BANDS],
-    dat_tb1  B_enc [MAX_CODES],
-    dat_tw2  W_dec [MAX_BANDS * MAX_CODES],
-    dat_tb2  B_dec [MAX_BANDS],
-    dat_tc1  LUT   [LUT_SIZE],
-    float    scaler_mean  [MAX_BANDS],
-    float    scaler_scale [MAX_BANDS],
-    float    hsi_in  [BUFFER_SIZE],
-    dat_tre  hsi_out [BUFFER_OUT],
-    int      height,
-    int      width,
-    float    input_scale,
-    int      input_zp,
-    unsigned int enc_mult,
-    int      enc_shift,
-    int      enc_act_zp,
-    int      sigmoid_zp,
-    unsigned int dec_mult,
-    int      dec_shift,
-    float    output_scale,
-    int      output_zp)
+    dat_tw1      W_enc [MAX_CODES * MAX_BANDS],
+    dat_tb1      B_enc [MAX_CODES],
+    dat_tw2      W_dec [MAX_BANDS * MAX_CODES],
+    dat_tb2      B_dec [MAX_BANDS],
+    dat_tc1      LUT   [LUT_SIZE],
+    float        hsi_in  [BUFFER_SIZE],
+    dat_tre      hsi_out [BUFFER_OUT],
+    ap_uint<16>  height,
+    ap_uint<16>  width,
+    float        input_scale,
+    ap_int<8>    input_zp,
+    ap_uint<32>  enc_mult,
+    ap_uint<8>   enc_shift,
+    ap_int<8>    enc_act_zp,
+    ap_int<8>    sigmoid_zp,
+    ap_uint<32>  dec_mult,
+    ap_uint<8>   dec_shift,
+    float        output_scale,
+    ap_int<8>    output_zp)
 {
-    /* ── AXI interfaces ─────────────────────────────────────────────────── */
-    /* Weights and biases — separate bundles to allow parallel access      */
-    #pragma HLS INTERFACE m_axi port=W_enc        bundle=aximm1
-    #pragma HLS INTERFACE m_axi port=B_enc        bundle=aximm2
-    #pragma HLS INTERFACE m_axi port=W_dec        bundle=aximm3
-    #pragma HLS INTERFACE m_axi port=B_dec        bundle=aximm4
-    /* LUT and scaler — share a bundle (small, loaded once, sequential)   */
-    #pragma HLS INTERFACE m_axi port=LUT          bundle=aximm5
-    #pragma HLS INTERFACE m_axi port=scaler_mean  bundle=aximm5
-    #pragma HLS INTERFACE m_axi port=scaler_scale bundle=aximm5
-    /* Image data — separate bundle for sustained bandwidth               */
-    #pragma HLS INTERFACE m_axi port=hsi_in       bundle=aximm6
-    #pragma HLS INTERFACE m_axi port=hsi_out      bundle=aximm6
+    /* ── AXI interfaces ──────────────────────────────────────────────────── */
+    #pragma HLS INTERFACE m_axi port=W_enc   bundle=aximm1
+    #pragma HLS INTERFACE m_axi port=B_enc   bundle=aximm2
+    #pragma HLS INTERFACE m_axi port=W_dec   bundle=aximm3
+    #pragma HLS INTERFACE m_axi port=B_dec   bundle=aximm4
+    #pragma HLS INTERFACE m_axi port=LUT     bundle=aximm5
+    #pragma HLS INTERFACE m_axi port=hsi_in  bundle=aximm6
+    #pragma HLS INTERFACE m_axi port=hsi_out bundle=aximm6
 
-    /* ── Control scalars — AXI-lite ────────────────────────────────────── */
+    /* ── Control scalars — AXI-lite ─────────────────────────────────────── */
     #pragma HLS INTERFACE s_axilite port=return
     #pragma HLS INTERFACE s_axilite port=height
     #pragma HLS INTERFACE s_axilite port=width
@@ -367,12 +326,12 @@ void dbn_inout(
     #pragma HLS DATAFLOW
 
     load_input  (hsi_in, hsi_stream, height, width);
-    encDec      (W_enc, W_dec, B_enc, B_dec, LUT, scaler_mean, scaler_scale,
+    encDec      (W_enc, W_dec, B_enc, B_dec, LUT,
                  hsi_stream, score_stream, height, width,
                  input_scale, input_zp,
-                 (ap_uint<32>)enc_mult, enc_shift, enc_act_zp,
+                 enc_mult, enc_shift, enc_act_zp,
                  sigmoid_zp,
-                 (ap_uint<32>)dec_mult, dec_shift,
+                 dec_mult, dec_shift,
                  output_scale, output_zp);
     store_result(hsi_out, score_stream, height, width);
 }
